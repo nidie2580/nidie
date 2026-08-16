@@ -395,23 +395,41 @@ export class PluginManager extends PluginBase {
       const isSelf = path.resolve(targetPath) === SELF_DIR
       const label = isSelf ? '插件管理器 (本插件)' : path.basename(targetPath)
 
-      await reply(e, `⏳ 正在更新${isSelf ? '本插件' : `插件「${path.basename(targetPath)}」`}... (最长 ${(TIMEOUT.GIT_PULL / 60000).toFixed(0)} 分钟)`)
+      // 1) 先检测是否有可用更新（fetch + HEAD 比对）
+      await reply(e, `🔍 正在检查${isSelf ? '本插件' : `插件「${path.basename(targetPath)}」`}是否有可用更新...`)
+      let status
+      try {
+        status = await this.checkUpdateAvailable(targetPath)
+      } catch (err) {
+        this.taskLock = false
+        return reply(e, `❌ ${label} 检测更新失败：${err.message}`)
+      }
+
+      // 2) 已是最新 → 直接跳过，不拉不装
+      if (!status.needUpdate) {
+        this.taskLock = false
+        return reply(e, `✅ ${label} 已是最新版本，无需更新\n分支：${status.branch}  提交：${(status.local || '').slice(0, 8)}`)
+      }
+
+      // 3) 有更新 → 告知落后多少个提交，再执行 pull
+      const behindTxt = status.behind > 0 ? `（落后 ${status.behind} 个提交）` : ''
+      await reply(e, `⏳ 发现可用更新${behindTxt}，正在拉取... (最长 ${(TIMEOUT.GIT_PULL / 60000).toFixed(0)} 分钟)`)
 
       let output = ''
       try {
         const { stdout } = await execWithTimeout(
-          'git pull',
+          'git pull --ff-only',
           { cwd: targetPath, maxBuffer: 10 * 1024 * 1024 },
           TIMEOUT.GIT_PULL,
           `拉取更新 ${path.basename(targetPath)}`
         )
         output = (stdout || '').trim()
       } catch (err) {
-        // 拉取超时 → 不继续装依赖，直接结束但不清理目录（不回滚，因为是已有插件）
         this.taskLock = false
         return reply(e, `❌ ${label} 更新失败：${err.message}\n⏪ 已中止（原版本未被修改）`)
       }
 
+      // 4) 装依赖（仅有更新时）
       let depMsg = ''
       try {
         await this.installDependencies(targetPath)
@@ -423,9 +441,6 @@ export class PluginManager extends PluginBase {
       }
 
       this.taskLock = false
-      if (/already up|up to date|已经是最新|没有内容更新/i.test(output)) {
-        return reply(e, `✅ ${label} 已是最新版本${depMsg}`)
-      }
       return reply(e, `✅ ${label} 更新成功\n${output}${depMsg}\n💡 发送 #重载插件 即可生效`)
     } catch (err) {
       this.taskLock = false
@@ -445,6 +460,86 @@ export class PluginManager extends PluginBase {
     return SELF_REPO_PATTERNS.some(re => re.test(input))
   }
 
+  /**
+   * 检查插件是否有可用更新（不修改工作区）
+   * 通过 git fetch + 比对本地 HEAD 与远程 HEAD 来判断
+   * @param {string} targetPath 插件目录
+   * @returns {Promise<{needUpdate:boolean, branch:string, local:string, remote:string, behind:number, reason?:string}>}
+   */
+  async checkUpdateAvailable(targetPath) {
+    // 1) git fetch 拉取远程引用，但不合并
+    try {
+      await execWithTimeout(
+        'git fetch --tags --depth=1 origin',
+        { cwd: targetPath, maxBuffer: 5 * 1024 * 1024 },
+        TIMEOUT.GIT_PULL,
+        `检测更新 ${path.basename(targetPath)}`
+      )
+    } catch (err) {
+      // fetch 失败 → 走老路直接 pull
+      Logger.warn(`[nidie] fetch 失败，回退到直接 pull: ${err.message}`)
+      return { needUpdate: true, branch: '', local: '', remote: '', behind: -1, reason: 'fetch_failed' }
+    }
+
+    // 2) 获取当前分支名
+    let branch = ''
+    try {
+      const { stdout: brOut } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: targetPath })
+      branch = (brOut || '').trim()
+    } catch (_) {}
+    if (!branch || branch === 'HEAD') {
+      // 处于 detached HEAD 状态，无法用 origin/<branch> 比对，回退到直接 pull
+      return { needUpdate: true, branch: 'detached', local: '', remote: '', behind: -1, reason: 'detached_head' }
+    }
+
+    // 3) 比对本地 HEAD 与 origin/<branch>
+    try {
+      const { stdout: localOut } = await execAsync('git rev-parse HEAD', { cwd: targetPath })
+      const local = (localOut || '').trim()
+      let remote = ''
+      try {
+        const { stdout: rOut } = await execAsync(`git rev-parse origin/${branch}`, { cwd: targetPath })
+        remote = (rOut || '').trim()
+      } catch (_) {
+        // 远程分支不存在（可能 origin 默认分支是 main/master，但本地是 master/main）
+        // 尝试常见默认分支
+        for (const candidate of ['main', 'master']) {
+          try {
+            const { stdout: rOut } = await execAsync(`git rev-parse origin/${candidate}`, { cwd: targetPath })
+            if (rOut && rOut.trim()) {
+              remote = rOut.trim()
+              branch = candidate  // 用真实存在的远程分支
+              break
+            }
+          } catch (_) {}
+        }
+        if (!remote) {
+          return { needUpdate: true, branch, local, remote: '', behind: -1, reason: 'remote_branch_not_found' }
+        }
+      }
+
+      // 4) 计算落后多少个提交
+      let behind = 0
+      if (local && remote && local !== remote) {
+        try {
+          const { stdout: bOut } = await execAsync(
+            `git rev-list --count HEAD..origin/${branch}`,
+            { cwd: targetPath }
+          )
+          behind = parseInt((bOut || '0').trim(), 10) || 0
+        } catch (_) {
+          behind = -1
+        }
+      }
+
+      const needUpdate = !local || !remote || local !== remote
+      return { needUpdate, branch, local, remote, behind }
+    } catch (err) {
+      Logger.warn(`[nidie] 比对 HEAD 失败，回退直接 pull: ${err.message}`)
+      return { needUpdate: true, branch, local: '', remote: '', behind: -1, reason: 'compare_failed' }
+    }
+  }
+
   async updateAllPlugins(e) {
     if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #更新全部插件')
     if (this.taskLock) return reply(e, '⚠️ 当前已有任务在执行中，请稍后再试...')
@@ -454,27 +549,60 @@ export class PluginManager extends PluginBase {
     if (updatable.length === 0) return reply(e, '❌ 没有可通过 git 更新的插件')
 
     this.taskLock = true
-    await reply(e, `⏳ 开始更新 ${updatable.length} 个插件，请耐心等待...`)
+    await reply(e, `⏳ 开始检查并更新 ${updatable.length} 个插件...`)
 
+    let updated = 0
+    let upToDate = 0
+    let failed = 0
     const results = []
+
     for (const p of updatable) {
+      // 1) 检测是否有可用更新
+      let status
+      try {
+        status = await this.checkUpdateAvailable(p.path)
+      } catch (err) {
+        failed++
+        results.push(`❌ ${p.name}：检测更新失败：${err.message}`)
+        continue
+      }
+
+      // 2) 已是最新 → 跳过，不执行 pull、不装依赖
+      if (!status.needUpdate) {
+        upToDate++
+        results.push(`✅ ${p.name}：已是最新`)
+        continue
+      }
+
+      // 3) 有更新 → 执行 pull
+      const behindTxt = status.behind > 0 ? `（落后 ${status.behind} 个提交）` : ''
       try {
         const { stdout } = await execWithTimeout(
-          'git pull',
+          'git pull --ff-only',
           { cwd: p.path, maxBuffer: 10 * 1024 * 1024 },
           TIMEOUT.GIT_PULL,
           `批量更新 ${p.name}`
         )
         const out = (stdout || '').trim()
-        results.push(/already up|up to date|已经是最新|没有内容更新/i.test(out) ? `✅ ${p.name}：已是最新` : `✅ ${p.name}：已更新`)
+        updated++
+        results.push(`🔄 ${p.name}：已更新${behindTxt}`)
       } catch (err) {
+        failed++
         const suffix = /超时/.test(err.message) ? '（已跳过）' : ''
         results.push(`❌ ${p.name}：${err.message}${suffix}`)
       }
     }
 
     this.taskLock = false
-    return reply(e, `插件更新完成：\n${results.join('\n')}\n\n💡 发送 #重载插件 即可生效`)
+    return reply(e,
+      `📊 批量更新完成\n` +
+      `   总计：${updatable.length}\n` +
+      `   ✅ 已是最新：${upToDate}\n` +
+      `   🔄 已更新：${updated}\n` +
+      `   ❌ 失败：${failed}\n\n` +
+      results.join('\n') +
+      `\n\n💡 发送 #重载插件 即可生效`
+    )
   }
 
   async listPlugins(e) {
