@@ -1,29 +1,19 @@
-import fs from 'node:fs'
-import path from 'node:path'
+import { PluginManager } from './apps/plugin_manager.js'
 
-// 插件入口
-// 加载 apps 目录下所有插件文件
-let ret = []
+// Yunzai 插件标准入口：导出插件类
+// Yunzai 启动时会扫描所有 plugins/*/index.js 的 exports，
+// 收集继承自 plugin 的类并实例化，注册 rule 到消息调度器。
+const plugins = [PluginManager]
 
-const files = fs
-  .readdirSync(path.resolve(path.dirname(new URL(import.meta.url).pathname), 'apps'))
-  .filter(file => file.endsWith('.js'))
+export { plugins }
+export { PluginManager }
+export default plugins
 
-files.forEach(file => {
-  ret.push(import(`./apps/${file}`))
-})
-
-ret = await Promise.allSettled(ret)
-
-for (const i in files) {
-  const name = files[i]
-  const res = ret[i]
-  if (res.status !== 'fulfilled') {
-    logger.error(`[nidie] 载入插件错误：${name}`)
-    logger.error(res.reason)
-    continue
+// 兼容日志打印（安全兜底：logger 未定义时不报错）
+try {
+  if (typeof logger !== 'undefined' && logger.info) {
+    logger.info('[nidie] 插件管理器加载成功')
+  } else if (typeof console !== 'undefined') {
+    console.log('[nidie] 插件管理器加载成功')
   }
-  logger.debug(`[nidie] 载入插件成功：${name}`)
-}
-
-logger.info('[nidie] 插件管理器加载完成')
+} catch (_) {}

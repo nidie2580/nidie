@@ -1,12 +1,38 @@
-import plugin from '../../lib/plugins/plugin.js'
-import cfg from '../../lib/config/config.js'
 import { exec, execSync } from 'child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { pipeline } from 'node:stream/promises'
-import { Readable } from 'node:stream'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
+
+// 安全的 logger（Yunzai 启动前 / 非 Yunzai 环境降级为 console）
+const Logger = new Proxy({}, {
+  get(_, key) {
+    if (typeof logger !== 'undefined' && logger[key]) {
+      return (...args) => { try { logger[key](...args) } catch (_) { console.log(`[nidie][${key}]`, ...args) } }
+    }
+    return (...args) => { console.log(`[nidie][${key}]`, ...args) }
+  }
+})
+
+// 兼容不同 Yunzai 版本的 plugin 父类路径
+let PluginBase
+try {
+  PluginBase = (await import('../../lib/plugins/plugin.js')).default
+} catch (_a) {
+  try {
+    PluginBase = (await import('../../../lib/plugins/plugin.js')).default
+  } catch (_b) {
+    try {
+      PluginBase = (await import(`${process.cwd()}/lib/plugins/plugin.js`)).default
+    } catch (_c) {
+      // 最后兜底：定义一个最小可用的父类，至少能实例化不报错
+      PluginBase = class PluginFallback {
+        constructor(cfg) { Object.assign(this, cfg) }
+        accept() { return true }
+      }
+    }
+  }
+}
 
 const execAsync = promisify(exec)
 
@@ -28,40 +54,80 @@ const PRESET_PLUGINS = {
   'cm-plugin': 'https://gitee.com/kyrk01/cm-plugin.git'
 }
 
-export class PluginManager extends plugin {
+// 主人权限判断（兼容不同 Yunzai 版本的字段名）
+function isMaster(e) {
+  if (!e) return false
+  if (e.isMaster === true || e.isMaster === 'true') return true
+  // 部分版本存的是 e.master / e.user_id
+  try {
+    if (typeof cfg !== 'undefined' && cfg?.master) {
+      const masters = Array.isArray(cfg.master) ? cfg.master : [String(cfg.master)]
+      const uid = String(e.user_id ?? e.sender?.user_id ?? '')
+      if (masters.includes(uid)) return true
+    }
+    if (globalThis?.cfg?.master) {
+      const masters = Array.isArray(globalThis.cfg.master) ? globalThis.cfg.master : [String(globalThis.cfg.master)]
+      const uid = String(e.user_id ?? e.sender?.user_id ?? '')
+      if (masters.includes(uid)) return true
+    }
+  } catch (_) {}
+  return false
+}
+
+// 统一回复方法：兼容 e.reply / 终端 stdin 的 fallback
+function reply(e, msg) {
+  if (!e) {
+    console.log(String(msg))
+    return Promise.resolve()
+  }
+  if (typeof e.reply === 'function') {
+    try {
+      const r = e.reply(msg)
+      return (r && typeof r.catch === 'function') ? r.catch(err => { Logger.error('reply失败', err.message) }) : Promise.resolve(r)
+    } catch (err) {
+      Logger.error('reply异常', err.message)
+      return Promise.resolve()
+    }
+  }
+  // 兜底：控制台打印
+  console.log(String(msg))
+  return Promise.resolve()
+}
+
+export class PluginManager extends PluginBase {
   constructor() {
     super({
       name: 'plugin-manager',
       dsc: '插件管理器 - 安装、卸载、更新、查看插件',
       event: 'message',
-      priority: 1,
+      priority: 50,
       rule: [
         {
-          reg: '^#?安装插件\\s*(.+)$',
-          fnc: 'installPlugin',
-          permission: 'master'
+          reg: '^#?插件管理帮助$',
+          fnc: 'showHelp'
         },
         {
-          reg: '^#?卸载插件\\s*(.+)$',
-          fnc: 'uninstallPlugin',
-          permission: 'master'
+          reg: '^#?安装插件\\s+\\S',
+          fnc: 'installPlugin'
         },
         {
-          reg: '^#?更新插件\\s*(.+)$',
-          fnc: 'updatePlugin',
-          permission: 'master'
+          reg: '^#?卸载插件\\s+\\S',
+          fnc: 'uninstallPlugin'
+        },
+        {
+          reg: '^#?更新插件\\s+\\S',
+          fnc: 'updatePlugin'
         },
         {
           reg: '^#?更新全部插件$',
-          fnc: 'updateAllPlugins',
-          permission: 'master'
+          fnc: 'updateAllPlugins'
         },
         {
           reg: '^#?插件列表$',
           fnc: 'listPlugins'
         },
         {
-          reg: '^#?插件详情\\s*(.+)$',
+          reg: '^#?插件详情\\s+\\S',
           fnc: 'pluginDetail'
         },
         {
@@ -70,59 +136,51 @@ export class PluginManager extends plugin {
         },
         {
           reg: '^#?重载插件$',
-          fnc: 'reloadPlugins',
-          permission: 'master'
-        },
-        {
-          reg: '^#?插件管理帮助$',
-          fnc: 'showHelp'
+          fnc: 'reloadPlugins'
         }
       ]
     })
     this.taskLock = false
   }
 
-  /**
-   * 安装插件
-   * 支持: git 仓库地址、预设插件名称、压缩包链接
-   */
+  // ===== 指令方法 =====
+
   async installPlugin(e) {
-    if (this.taskLock) return e.reply('⚠️ 当前已有任务在执行中，请稍后再试...')
-    const input = e.msg.replace(/^#?安装插件\s*/, '').trim()
-    if (!input) return e.reply('请提供插件名称或仓库地址\n示例：#安装插件 miao-plugin\n示例：#安装插件 https://gitee.com/xxx/xxx.git')
+    if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #安装插件')
+    if (this.taskLock) return reply(e, '⚠️ 当前已有任务在执行中，请稍后再试...')
 
-    // 解析目标仓库地址
+    const text = String(e?.msg ?? e?.raw_message ?? '')
+    const input = text.replace(/^#?安装插件\s*/, '').trim()
+    if (!input) return reply(e, '请提供插件名称或仓库地址\n示例：#安装插件 miao-plugin\n示例：#安装插件 https://gitee.com/xxx/xxx.git')
+
     const repoUrl = this.resolveRepoUrl(input)
-    if (!repoUrl) return e.reply(`❌ 未找到插件「${input}」\n可发送 #可用插件 查看支持的插件\n或直接使用 git 仓库地址安装`)
+    if (!repoUrl) return reply(e, `❌ 未找到插件「${input}」\n可发送 #可用插件 查看支持的插件\n或直接使用 git 仓库地址安装`)
 
-    // 插件目录名
     const dirName = this.parseRepoName(repoUrl)
     const targetPath = path.join(PLUGINS_DIR, dirName)
 
     if (fs.existsSync(targetPath)) {
-      return e.reply(`❌ 插件「${dirName}」已存在\n如需更新请使用：#更新插件 ${dirName}\n如需重装请先卸载：#卸载插件 ${dirName}`)
+      return reply(e, `❌ 插件「${dirName}」已存在\n如需更新请使用：#更新插件 ${dirName}\n如需重装请先卸载：#卸载插件 ${dirName}`)
     }
 
     this.taskLock = true
-    const msg = await e.reply(`⏳ 正在安装插件「${dirName}」...\n仓库地址：${repoUrl}\n请耐心等待，安装过程可能需要一些时间`)
     try {
-      // 1. 克隆仓库
-      await e.reply(`📦 [1/3] 正在克隆仓库...`)
+      await reply(e, `⏳ 正在安装插件「${dirName}」...\n仓库地址：${repoUrl}\n请耐心等待，安装过程可能需要一些时间`)
+
+      await reply(e, `📦 [1/3] 正在克隆仓库...`)
       await this.gitClone(repoUrl, targetPath)
 
-      // 2. 安装依赖
-      await e.reply(`📦 [2/3] 正在安装依赖...`)
+      await reply(e, `📦 [2/3] 正在安装依赖...`)
       await this.installDependencies(targetPath)
 
-      // 3. 校验插件结构
-      await e.reply(`📦 [3/3] 正在校验插件结构...`)
+      await reply(e, `📦 [3/3] 正在校验插件结构...`)
       const valid = this.validatePlugin(targetPath)
-
       const tips = []
       if (!valid) tips.push('⚠️ 未检测到 apps 目录或 index.js，请确认插件结构是否正确')
 
       this.taskLock = false
-      return e.reply(
+      return reply(
+        e,
         `✅ 插件「${dirName}」安装成功！\n` +
         `📁 安装路径：${path.relative(process.cwd(), targetPath)}\n` +
         `${tips.length ? tips.join('\n') + '\n' : ''}` +
@@ -130,54 +188,53 @@ export class PluginManager extends plugin {
       )
     } catch (err) {
       this.taskLock = false
-      // 安装失败时清理目录
       this.removeDir(targetPath)
-      logger.error(`[plugin-manager] 安装失败: ${err.stack || err}`)
-      return e.reply(`❌ 插件安装失败：${err.message}\n已自动清理残留文件`)
+      Logger.error(`安装失败: ${err.stack || err}`)
+      return reply(e, `❌ 插件安装失败：${err.message}\n已自动清理残留文件`)
     }
   }
 
-  /**
-   * 卸载插件
-   */
   async uninstallPlugin(e) {
-    const name = e.msg.replace(/^#?卸载插件\s*/, '').trim()
-    if (!name) return e.reply('请提供插件名称\n示例：#卸载插件 miao-plugin')
+    if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #卸载插件')
+
+    const text = String(e?.msg ?? e?.raw_message ?? '')
+    const name = text.replace(/^#?卸载插件\s*/, '').trim()
+    if (!name) return reply(e, '请提供插件名称\n示例：#卸载插件 miao-plugin')
 
     const targetPath = this.findPluginPath(name)
-    if (!targetPath) return e.reply(`❌ 未找到插件「${name}」\n可发送 #插件列表 查看已安装插件`)
+    if (!targetPath) return reply(e, `❌ 未找到插件「${name}」\n可发送 #插件列表 查看已安装插件`)
 
-    // 禁止卸载本插件自身
     if (path.resolve(targetPath) === SELF_DIR) {
-      return e.reply('⚠️ 无法卸载插件管理器自身')
+      return reply(e, '⚠️ 无法卸载插件管理器自身')
     }
 
     try {
       this.removeDir(targetPath)
-      return e.reply(
+      return reply(
+        e,
         `✅ 插件「${path.basename(targetPath)}」已卸载\n` +
         `📁 已删除：${path.relative(process.cwd(), targetPath)}\n` +
         `💡 发送 #重载插件 即可生效`
       )
     } catch (err) {
-      logger.error(`[plugin-manager] 卸载失败: ${err.stack || err}`)
-      return e.reply(`❌ 插件卸载失败：${err.message}`)
+      Logger.error(`卸载失败: ${err.stack || err}`)
+      return reply(e, `❌ 插件卸载失败：${err.message}`)
     }
   }
 
-  /**
-   * 更新单个插件
-   */
   async updatePlugin(e) {
-    if (this.taskLock) return e.reply('⚠️ 当前已有任务在执行中，请稍后再试...')
-    const name = e.msg.replace(/^#?更新插件\s*/, '').trim()
-    if (!name) return e.reply('请提供插件名称\n示例：#更新插件 miao-plugin')
+    if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #更新插件')
+    if (this.taskLock) return reply(e, '⚠️ 当前已有任务在执行中，请稍后再试...')
+
+    const text = String(e?.msg ?? e?.raw_message ?? '')
+    const name = text.replace(/^#?更新插件\s*/, '').trim()
+    if (!name) return reply(e, '请提供插件名称\n示例：#更新插件 miao-plugin')
 
     const targetPath = this.findPluginPath(name)
-    if (!targetPath) return e.reply(`❌ 未找到插件「${name}」\n可发送 #插件列表 查看已安装插件`)
+    if (!targetPath) return reply(e, `❌ 未找到插件「${name}」\n可发送 #插件列表 查看已安装插件`)
 
     if (!fs.existsSync(path.join(targetPath, '.git'))) {
-      return e.reply(`⚠️ 插件「${path.basename(targetPath)}」不是 git 仓库，无法更新`)
+      return reply(e, `⚠️ 插件「${path.basename(targetPath)}」不是 git 仓库，无法更新`)
     }
 
     this.taskLock = true
@@ -185,7 +242,6 @@ export class PluginManager extends plugin {
       const { stdout } = await execAsync('git pull', { cwd: targetPath })
       const output = (stdout || '').trim()
 
-      // 检查是否有依赖更新
       let depMsg = ''
       try {
         await this.installDependencies(targetPath)
@@ -195,57 +251,46 @@ export class PluginManager extends plugin {
       }
 
       this.taskLock = false
-
       if (/already up|up to date|已经是最新|没有内容更新/i.test(output)) {
-        return e.reply(`✅ 插件「${path.basename(targetPath)}」已是最新版本${depMsg}`)
+        return reply(e, `✅ 插件「${path.basename(targetPath)}」已是最新版本${depMsg}`)
       }
-      return e.reply(`✅ 插件「${path.basename(targetPath)}」更新成功\n${output}${depMsg}\n💡 发送 #重载插件 即可生效`)
+      return reply(e, `✅ 插件「${path.basename(targetPath)}」更新成功\n${output}${depMsg}\n💡 发送 #重载插件 即可生效`)
     } catch (err) {
       this.taskLock = false
-      logger.error(`[plugin-manager] 更新失败: ${err.stack || err}`)
-      return e.reply(`❌ 插件更新失败：${err.message}`)
+      Logger.error(`更新失败: ${err.stack || err}`)
+      return reply(e, `❌ 插件更新失败：${err.message}`)
     }
   }
 
-  /**
-   * 更新全部插件
-   */
   async updateAllPlugins(e) {
-    if (this.taskLock) return e.reply('⚠️ 当前已有任务在执行中，请稍后再试...')
+    if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #更新全部插件')
+    if (this.taskLock) return reply(e, '⚠️ 当前已有任务在执行中，请稍后再试...')
 
     const plugins = this.scanPlugins()
     const updatable = plugins.filter(p => fs.existsSync(path.join(p.path, '.git')))
-
-    if (updatable.length === 0) return e.reply('❌ 没有可通过 git 更新的插件')
+    if (updatable.length === 0) return reply(e, '❌ 没有可通过 git 更新的插件')
 
     this.taskLock = true
-    await e.reply(`⏳ 开始更新 ${updatable.length} 个插件，请耐心等待...`)
+    await reply(e, `⏳ 开始更新 ${updatable.length} 个插件，请耐心等待...`)
 
     const results = []
     for (const p of updatable) {
       try {
         const { stdout } = await execAsync('git pull', { cwd: p.path })
         const out = (stdout || '').trim()
-        if (/already up|up to date|已经是最新|没有内容更新/i.test(out)) {
-          results.push(`✅ ${p.name}：已是最新`)
-        } else {
-          results.push(`✅ ${p.name}：已更新`)
-        }
+        results.push(/already up|up to date|已经是最新|没有内容更新/i.test(out) ? `✅ ${p.name}：已是最新` : `✅ ${p.name}：已更新`)
       } catch (err) {
         results.push(`❌ ${p.name}：${err.message}`)
       }
     }
 
     this.taskLock = false
-    return e.reply(`插件更新完成：\n${results.join('\n')}\n\n💡 发送 #重载插件 即可生效`)
+    return reply(e, `插件更新完成：\n${results.join('\n')}\n\n💡 发送 #重载插件 即可生效`)
   }
 
-  /**
-   * 列出已安装插件
-   */
   async listPlugins(e) {
     const plugins = this.scanPlugins()
-    if (plugins.length === 0) return e.reply('当前未检测到任何插件')
+    if (plugins.length === 0) return reply(e, '当前未检测到任何插件')
 
     const list = plugins.map((p, i) => {
       const isGit = fs.existsSync(path.join(p.path, '.git'))
@@ -253,50 +298,47 @@ export class PluginManager extends plugin {
       return `${i + 1}. ${p.name}${isGit ? ' (git)' : ''}\n   ${relPath}`
     })
 
-    return e.reply(`📦 已安装插件列表 (共 ${plugins.length} 个)\n\n${list.join('\n\n')}`)
+    return reply(e, `📦 已安装插件列表 (共 ${plugins.length} 个)\n\n${list.join('\n\n')}`)
   }
 
-  /**
-   * 插件详情
-   */
   async pluginDetail(e) {
-    const name = e.msg.replace(/^#?插件详情\s*/, '').trim()
-    if (!name) return e.reply('请提供插件名称\n示例：#插件详情 miao-plugin')
+    const text = String(e?.msg ?? e?.raw_message ?? '')
+    const name = text.replace(/^#?插件详情\s*/, '').trim()
+    if (!name) return reply(e, '请提供插件名称\n示例：#插件详情 miao-plugin')
 
     const targetPath = this.findPluginPath(name)
-    if (!targetPath) return e.reply(`❌ 未找到插件「${name}」`)
+    if (!targetPath) return reply(e, `❌ 未找到插件「${name}」`)
 
     const dirName = path.basename(targetPath)
     const isGit = fs.existsSync(path.join(targetPath, '.git'))
     let gitInfo = ''
     if (isGit) {
       try {
-        const remote = execSync('git remote get-url origin', { cwd: targetPath }).toString().trim()
-        const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: targetPath }).toString().trim()
-        const commit = execSync('git log -1 --format=%h %cd %s', { cwd: targetPath, env: { ...process.env, GIT_AUTHOR_DATE: '', GIT_COMMITTER_DATE: '' } }).toString().trim()
+        const remote = execSync('git remote get-url origin', { cwd: targetPath, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+        const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: targetPath, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+        const commit = execSync('git log -1 --format=%h %s', { cwd: targetPath, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
         gitInfo = `\nGit 信息：\n  远程：${remote}\n  分支：${branch}\n  最新提交：${commit}`
-      } catch {}
+      } catch (_) {}
     }
 
-    // 统计 apps 目录下的 js 文件
     let appCount = 0
     const appsDir = path.join(targetPath, 'apps')
     if (fs.existsSync(appsDir)) {
       appCount = fs.readdirSync(appsDir).filter(f => f.endsWith('.js')).length
     }
 
-    // package.json 信息
     let pkgInfo = ''
     const pkgPath = path.join(targetPath, 'package.json')
     if (fs.existsSync(pkgPath)) {
       try {
         const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'))
         pkgInfo = `\n版本：${pkg.version || '未知'}\n描述：${pkg.description || '无'}`
-      } catch {}
+      } catch (_) {}
     }
 
     const relPath = path.relative(process.cwd(), targetPath)
-    return e.reply(
+    return reply(
+      e,
       `📦 插件详情：${dirName}\n\n` +
       `路径：${relPath}\n` +
       `类型：${isGit ? 'git 仓库' : '本地目录'}\n` +
@@ -304,44 +346,41 @@ export class PluginManager extends plugin {
     )
   }
 
-  /**
-   * 列出可用预设插件
-   */
   async listPresetPlugins(e) {
     const entries = Object.entries(PRESET_PLUGINS)
     const list = entries.map(([name, url], i) => {
       const installed = this.findPluginPath(name) ? '✅ 已安装' : '⬜ 未安装'
       return `${i + 1}. ${name}\n   ${url}\n   ${installed}`
     })
-    return e.reply(
+    return reply(
+      e,
       `📋 可用插件列表 (共 ${entries.length} 个)\n\n` +
       `${list.join('\n\n')}\n\n` +
       `💡 使用 #安装插件 <名称> 即可安装`
     )
   }
 
-  /**
-   * 重载插件
-   */
   async reloadPlugins(e) {
+    if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #重载插件')
     try {
-      if (typeof globalThis.runtime === 'object' && runtime.loadPlugins) {
-        await runtime.loadPlugins()
-        return e.reply('✅ 插件已重新加载')
+      if (typeof globalThis.runtime === 'object' && globalThis.runtime.loadPlugins) {
+        await globalThis.runtime.loadPlugins()
+        return reply(e, '✅ 插件已重新加载')
       }
-      // 兜底：提示手动重启
-      return e.reply('✅ 已尝试重载插件\n若未生效请手动重启 Yunzai')
+      if (typeof globalThis.Bot === 'object' && globalThis.Bot.reloadPlugins) {
+        await globalThis.Bot.reloadPlugins()
+        return reply(e, '✅ 插件已重新加载')
+      }
+      return reply(e, '✅ 已尝试重载插件\n若未生效请手动重启 Yunzai')
     } catch (err) {
-      logger.error(`[plugin-manager] 重载失败: ${err.stack || err}`)
-      return e.reply(`❌ 重载失败：${err.message}`)
+      Logger.error(`重载失败: ${err.stack || err}`)
+      return reply(e, `❌ 重载失败：${err.message}`)
     }
   }
 
-  /**
-   * 显示帮助
-   */
   async showHelp(e) {
-    return e.reply(
+    return reply(
+      e,
       `📦 插件管理器 - 使用帮助\n\n` +
       `#安装插件 <名称|仓库地址>\n   安装一个插件，支持预设名称或 git 地址\n` +
       `#卸载插件 <名称>\n   卸载指定插件\n` +
@@ -350,7 +389,8 @@ export class PluginManager extends plugin {
       `#插件列表\n   查看已安装的插件\n` +
       `#插件详情 <名称>\n   查看插件详细信息\n` +
       `#可用插件\n   查看可一键安装的插件\n` +
-      `#重载插件\n   重新加载所有插件\n\n` +
+      `#重载插件\n   重新加载所有插件\n` +
+      `#插件管理帮助\n   查看本帮助\n\n` +
       `⚠️ 安装/卸载/更新/重载 操作仅主人可用\n` +
       `💡 仓库：https://github.com/nidie2580/nidie`
     )
@@ -358,137 +398,97 @@ export class PluginManager extends plugin {
 
   // ===== 内部工具方法 =====
 
-  /**
-   * 解析仓库地址：预设名称 → 完整 URL
-   */
   resolveRepoUrl(input) {
-    // 直接是 git 地址
-    if (/^(https?|git):\/\//.test(input) || input.startsWith('git@')) {
-      return input
-    }
-    // gitee/github 简写 owner/repo
-    if (/^[\w.-]+\/[\w.-]+$/.test(input)) {
-      return `https://gitee.com/${input}.git`
-    }
-    // 预设插件名
-    if (PRESET_PLUGINS[input]) {
-      return PRESET_PLUGINS[input]
-    }
+    if (/^(https?|git):\/\//.test(input) || input.startsWith('git@')) return input
+    if (/^[\w.-]+\/[\w.-]+$/.test(input)) return `https://gitee.com/${input}.git`
+    if (PRESET_PLUGINS[input]) return PRESET_PLUGINS[input]
     return null
   }
 
-  /**
-   * 从仓库地址解析插件目录名
-   */
   parseRepoName(url) {
     const cleaned = url.replace(/\.git$/, '').replace(/\/$/, '')
     const parts = cleaned.split(/[:/]/)
     return parts[parts.length - 1]
   }
 
-  /**
-   * git 克隆
-   */
   async gitClone(repoUrl, targetPath) {
     return new Promise((resolve, reject) => {
       const cmd = `git clone --depth=1 "${repoUrl}" "${targetPath}"`
       exec(cmd, { cwd: PLUGINS_DIR, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) {
-          reject(new Error(stderr?.trim() || err.message))
-        } else {
-          resolve(stdout)
-        }
+        if (err) reject(new Error(stderr?.trim() || err.message))
+        else resolve(stdout)
       })
     })
   }
 
-  /**
-   * 安装依赖
-   */
   async installDependencies(targetPath) {
     const pkgPath = path.join(targetPath, 'package.json')
     if (!fs.existsSync(pkgPath)) return
 
-    // 优先使用 pnpm, 其次 npm
     let cmd = 'npm install --omit=dev'
     try {
       execSync('pnpm -v', { stdio: 'ignore' })
       cmd = 'pnpm install --prod'
-    } catch {}
+    } catch (_) {}
 
-    await new Promise((resolve, reject) => {
+    await new Promise(resolve => {
       exec(cmd, { cwd: targetPath, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) {
-          // 依赖安装失败不阻断整体流程，给出警告
-          logger.warn(`[plugin-manager] 依赖安装告警: ${stderr?.trim() || err.message}`)
-          resolve(stdout)
-        } else {
-          resolve(stdout)
-        }
+        if (err) Logger.warn(`依赖安装告警: ${stderr?.trim() || err.message}`)
+        resolve(stdout || '')
       })
     })
   }
 
-  /**
-   * 校验插件结构是否合法
-   */
   validatePlugin(targetPath) {
-    const hasAppsDir = fs.existsSync(path.join(targetPath, 'apps'))
-    const hasIndex = fs.existsSync(path.join(targetPath, 'index.js'))
-    const hasPackage = fs.existsSync(path.join(targetPath, 'package.json'))
-    return hasAppsDir || hasIndex || hasPackage
+    return (
+      fs.existsSync(path.join(targetPath, 'apps')) ||
+      fs.existsSync(path.join(targetPath, 'index.js')) ||
+      fs.existsSync(path.join(targetPath, 'package.json'))
+    )
   }
 
-  /**
-   * 扫描 plugins 目录下的插件
-   */
   scanPlugins() {
     const result = []
     if (!fs.existsSync(PLUGINS_DIR)) return result
 
-    const entries = fs.readdirSync(PLUGINS_DIR, { withFileTypes: true })
+    let entries = []
+    try {
+      entries = fs.readdirSync(PLUGINS_DIR, { withFileTypes: true })
+    } catch (err) {
+      Logger.error(`扫描插件目录失败: ${err.message}`)
+      return result
+    }
+
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
       const name = entry.name
-      // 过滤系统目录
       if (['example', 'genshin', 'system', 'other'].includes(name)) continue
       if (name.startsWith('.')) continue
       const full = path.join(PLUGINS_DIR, name)
-      // 判断是否为插件目录
       const isPlugin =
         fs.existsSync(path.join(full, 'apps')) ||
         fs.existsSync(path.join(full, 'index.js')) ||
         fs.existsSync(path.join(full, 'package.json'))
-      if (isPlugin) {
-        result.push({ name, path: full })
-      }
+      if (isPlugin) result.push({ name, path: full })
     }
     return result
   }
 
-  /**
-   * 查找插件路径（支持模糊匹配）
-   */
   findPluginPath(name) {
     const plugins = this.scanPlugins()
-    // 精确匹配
     const exact = plugins.find(p => p.name === name)
     if (exact) return exact.path
-    // 包含匹配
     const fuzzy = plugins.find(p => p.name.toLowerCase().includes(name.toLowerCase()))
     if (fuzzy) return fuzzy.path
     return null
   }
 
-  /**
-   * 递归删除目录
-   */
   removeDir(dirPath) {
     if (!fs.existsSync(dirPath)) return
     try {
       fs.rmSync(dirPath, { recursive: true, force: true })
     } catch (err) {
-      logger.error(`[plugin-manager] 删除目录失败: ${err.message}`)
+      Logger.error(`删除目录失败: ${err.message}`)
       throw err
     }
   }
