@@ -1,0 +1,20 @@
+{
+  "name": "nidie",
+  "version": "1.0.0",
+  "description": "Yunzai-Bot 插件管理器 - 安装、卸载、更新、查看插件",
+  "type": "module",
+  "main": "index.js",
+  "author": "nidie2580",
+  "homepage": "https://github.com/nidie2580/nidie",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nidie2580/nidie.git"
+  },
+  "keywords": [
+    "yunzai",
+    "yunzai-bot",
+    "plugin",
+    "plugin-manager"
+  ],
+  "license": "MIT"
+}
