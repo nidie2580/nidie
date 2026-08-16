@@ -25,7 +25,6 @@ try {
     try {
       PluginBase = (await import(`${process.cwd()}/lib/plugins/plugin.js`)).default
     } catch (_c) {
-      // 最后兜底：定义一个最小可用的父类，至少能实例化不报错
       PluginBase = class PluginFallback {
         constructor(cfg) { Object.assign(this, cfg) }
         accept() { return true }
@@ -34,14 +33,27 @@ try {
   }
 }
 
+// 兼容不同 Yunzai 版本的 puppeteer 路径
+let Puppeteer = null
+try {
+  Puppeteer = (await import('../../lib/puppeteer/puppeteer.js')).default
+} catch (_a) {
+  try {
+    Puppeteer = (await import('../../../lib/puppeteer/puppeteer.js')).default
+  } catch (_b) {
+    try {
+      Puppeteer = (await import(`${process.cwd()}/lib/puppeteer/puppeteer.js`)).default
+    } catch (_c) {
+      Puppeteer = null
+    }
+  }
+}
+
 const execAsync = promisify(exec)
 
-// 插件根目录 (Yunzai 的 plugins 目录)
 const PLUGINS_DIR = path.resolve(process.cwd(), 'plugins')
-// 本插件所在目录
 const SELF_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
-// 常用 Yunzai 插件预设仓库
 const PRESET_PLUGINS = {
   'ws-plugin': 'https://gitee.com/xiaoye12123/ws-plugin.git',
   'guoba-plugin': 'https://gitee.com/guoba-yunzai/guoba-plugin.git',
@@ -54,11 +66,9 @@ const PRESET_PLUGINS = {
   'cm-plugin': 'https://gitee.com/kyrk01/cm-plugin.git'
 }
 
-// 主人权限判断（兼容不同 Yunzai 版本的字段名）
 function isMaster(e) {
   if (!e) return false
   if (e.isMaster === true || e.isMaster === 'true') return true
-  // 部分版本存的是 e.master / e.user_id
   try {
     if (typeof cfg !== 'undefined' && cfg?.master) {
       const masters = Array.isArray(cfg.master) ? cfg.master : [String(cfg.master)]
@@ -74,7 +84,6 @@ function isMaster(e) {
   return false
 }
 
-// 统一回复方法：兼容 e.reply / 终端 stdin 的 fallback
 function reply(e, msg) {
   if (!e) {
     console.log(String(msg))
@@ -89,55 +98,32 @@ function reply(e, msg) {
       return Promise.resolve()
     }
   }
-  // 兜底：控制台打印
   console.log(String(msg))
   return Promise.resolve()
+}
+
+// HTML 转义
+function esc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
 export class PluginManager extends PluginBase {
   constructor() {
     super({
       name: 'plugin-manager',
-      dsc: '插件管理器 - 安装、卸载、更新、查看插件',
+      dsc: '插件管理器 - 安装、删除、更新、查看插件',
       event: 'message',
       priority: 50,
       rule: [
-        {
-          reg: '^#?插件管理帮助$',
-          fnc: 'showHelp'
-        },
-        {
-          reg: '^#?安装插件\\s+\\S',
-          fnc: 'installPlugin'
-        },
-        {
-          reg: '^#?卸载插件\\s+\\S',
-          fnc: 'uninstallPlugin'
-        },
-        {
-          reg: '^#?更新插件\\s+\\S',
-          fnc: 'updatePlugin'
-        },
-        {
-          reg: '^#?更新全部插件$',
-          fnc: 'updateAllPlugins'
-        },
-        {
-          reg: '^#?插件列表$',
-          fnc: 'listPlugins'
-        },
-        {
-          reg: '^#?插件详情\\s+\\S',
-          fnc: 'pluginDetail'
-        },
-        {
-          reg: '^#?可用插件$',
-          fnc: 'listPresetPlugins'
-        },
-        {
-          reg: '^#?重载插件$',
-          fnc: 'reloadPlugins'
-        }
+        { reg: '^#?插件管理帮助$', fnc: 'showHelp' },
+        { reg: '^#?安装\\s+\\S', fnc: 'installPlugin' },
+        { reg: '^#?删除\\s+\\S', fnc: 'uninstallPlugin' },
+        { reg: '^#?更新插件\\s+\\S', fnc: 'updatePlugin' },
+        { reg: '^#?更新全部插件$', fnc: 'updateAllPlugins' },
+        { reg: '^#?插件列表$', fnc: 'listPlugins' },
+        { reg: '^#?插件详情\\s+\\S', fnc: 'pluginDetail' },
+        { reg: '^#?插件市场$', fnc: 'listPresetPlugins' },
+        { reg: '^#?重载插件$', fnc: 'reloadPlugins' }
       ]
     })
     this.taskLock = false
@@ -146,21 +132,21 @@ export class PluginManager extends PluginBase {
   // ===== 指令方法 =====
 
   async installPlugin(e) {
-    if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #安装插件')
+    if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #安装')
     if (this.taskLock) return reply(e, '⚠️ 当前已有任务在执行中，请稍后再试...')
 
     const text = String(e?.msg ?? e?.raw_message ?? '')
-    const input = text.replace(/^#?安装插件\s*/, '').trim()
-    if (!input) return reply(e, '请提供插件名称或仓库地址\n示例：#安装插件 miao-plugin\n示例：#安装插件 https://gitee.com/xxx/xxx.git')
+    const input = text.replace(/^#?安装\s*/, '').trim()
+    if (!input) return reply(e, '请提供插件名称或仓库地址\n示例：#安装 miao-plugin\n示例：#安装 https://gitee.com/xxx/xxx.git')
 
     const repoUrl = this.resolveRepoUrl(input)
-    if (!repoUrl) return reply(e, `❌ 未找到插件「${input}」\n可发送 #可用插件 查看支持的插件\n或直接使用 git 仓库地址安装`)
+    if (!repoUrl) return reply(e, `❌ 未找到插件「${input}」\n可发送 #插件市场 查看支持的插件\n或直接使用 git 仓库地址安装`)
 
     const dirName = this.parseRepoName(repoUrl)
     const targetPath = path.join(PLUGINS_DIR, dirName)
 
     if (fs.existsSync(targetPath)) {
-      return reply(e, `❌ 插件「${dirName}」已存在\n如需更新请使用：#更新插件 ${dirName}\n如需重装请先卸载：#卸载插件 ${dirName}`)
+      return reply(e, `❌ 插件「${dirName}」已存在\n如需更新请使用：#更新插件 ${dirName}\n如需重装请先删除：#删除 ${dirName}`)
     }
 
     this.taskLock = true
@@ -195,30 +181,30 @@ export class PluginManager extends PluginBase {
   }
 
   async uninstallPlugin(e) {
-    if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #卸载插件')
+    if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #删除')
 
     const text = String(e?.msg ?? e?.raw_message ?? '')
-    const name = text.replace(/^#?卸载插件\s*/, '').trim()
-    if (!name) return reply(e, '请提供插件名称\n示例：#卸载插件 miao-plugin')
+    const name = text.replace(/^#?删除\s*/, '').trim()
+    if (!name) return reply(e, '请提供插件名称\n示例：#删除 miao-plugin')
 
     const targetPath = this.findPluginPath(name)
     if (!targetPath) return reply(e, `❌ 未找到插件「${name}」\n可发送 #插件列表 查看已安装插件`)
 
     if (path.resolve(targetPath) === SELF_DIR) {
-      return reply(e, '⚠️ 无法卸载插件管理器自身')
+      return reply(e, '⚠️ 无法删除插件管理器自身')
     }
 
     try {
       this.removeDir(targetPath)
       return reply(
         e,
-        `✅ 插件「${path.basename(targetPath)}」已卸载\n` +
+        `✅ 插件「${path.basename(targetPath)}」已删除\n` +
         `📁 已删除：${path.relative(process.cwd(), targetPath)}\n` +
         `💡 发送 #重载插件 即可生效`
       )
     } catch (err) {
-      Logger.error(`卸载失败: ${err.stack || err}`)
-      return reply(e, `❌ 插件卸载失败：${err.message}`)
+      Logger.error(`删除失败: ${err.stack || err}`)
+      return reply(e, `❌ 插件删除失败：${err.message}`)
     }
   }
 
@@ -292,13 +278,24 @@ export class PluginManager extends PluginBase {
     const plugins = this.scanPlugins()
     if (plugins.length === 0) return reply(e, '当前未检测到任何插件')
 
-    const list = plugins.map((p, i) => {
+    const rows = plugins.map((p, i) => {
       const isGit = fs.existsSync(path.join(p.path, '.git'))
       const relPath = path.relative(PLUGINS_DIR, p.path)
-      return `${i + 1}. ${p.name}${isGit ? ' (git)' : ''}\n   ${relPath}`
+      return {
+        index: i + 1,
+        name: p.name,
+        type: isGit ? 'git' : 'local',
+        path: relPath
+      }
     })
 
-    return reply(e, `📦 已安装插件列表 (共 ${plugins.length} 个)\n\n${list.join('\n\n')}`)
+    return this.renderListImage(e, {
+      title: '已安装插件',
+      subtitle: `共 ${plugins.length} 个`,
+      columns: ['#', '名称', '类型', '路径'],
+      rows: rows.map(r => [r.index, r.name, r.type, r.path]),
+      footer: '发送 #插件详情 <名称> 查看详情'
+    })
   }
 
   async pluginDetail(e) {
@@ -348,16 +345,23 @@ export class PluginManager extends PluginBase {
 
   async listPresetPlugins(e) {
     const entries = Object.entries(PRESET_PLUGINS)
-    const list = entries.map(([name, url], i) => {
+    const rows = entries.map(([name, url], i) => {
       const installed = this.findPluginPath(name) ? '✅ 已安装' : '⬜ 未安装'
-      return `${i + 1}. ${name}\n   ${url}\n   ${installed}`
+      return {
+        index: i + 1,
+        name,
+        url,
+        status: installed
+      }
     })
-    return reply(
-      e,
-      `📋 可用插件列表 (共 ${entries.length} 个)\n\n` +
-      `${list.join('\n\n')}\n\n` +
-      `💡 使用 #安装插件 <名称> 即可安装`
-    )
+
+    return this.renderListImage(e, {
+      title: '插件市场',
+      subtitle: `共 ${entries.length} 个可用插件`,
+      columns: ['#', '名称', '仓库地址', '状态'],
+      rows: rows.map(r => [r.index, r.name, r.url, r.status]),
+      footer: '发送 #安装 <名称> 即可安装'
+    })
   }
 
   async reloadPlugins(e) {
@@ -382,18 +386,143 @@ export class PluginManager extends PluginBase {
     return reply(
       e,
       `📦 插件管理器 - 使用帮助\n\n` +
-      `#安装插件 <名称|仓库地址>\n   安装一个插件，支持预设名称或 git 地址\n` +
-      `#卸载插件 <名称>\n   卸载指定插件\n` +
+      `#安装 <名称|仓库地址>\n   安装一个插件，支持预设名或 git 地址\n` +
+      `#删除 <名称>\n   删除指定插件\n` +
       `#更新插件 <名称>\n   更新指定插件\n` +
       `#更新全部插件\n   更新所有 git 插件\n` +
-      `#插件列表\n   查看已安装的插件\n` +
+      `#插件列表\n   查看已安装的插件（图片）\n` +
+      `#插件市场\n   查看可一键安装的插件（图片）\n` +
       `#插件详情 <名称>\n   查看插件详细信息\n` +
-      `#可用插件\n   查看可一键安装的插件\n` +
       `#重载插件\n   重新加载所有插件\n` +
       `#插件管理帮助\n   查看本帮助\n\n` +
-      `⚠️ 安装/卸载/更新/重载 操作仅主人可用\n` +
+      `⚠️ 安装/删除/更新/重载 操作仅主人可用\n` +
       `💡 仓库：https://github.com/nidie2580/nidie`
     )
+  }
+
+  // ===== 图片渲染 =====
+
+  async renderListImage(e, { title, subtitle, columns, rows, footer }) {
+    // 没有 puppeteer 时降级为纯文本
+    if (!Puppeteer || typeof Puppeteer.screenshot !== 'function') {
+      return this.renderListText(e, { title, subtitle, columns, rows, footer })
+    }
+
+    const html = this.buildListHtml({ title, subtitle, columns, rows, footer })
+    try {
+      const img = await Puppeteer.screenshot('plugin-manager', {
+        html,
+        header: { styles: '' },
+        // puppeteer.screenshot 默认会按内容自适应高度
+      })
+      if (img) return reply(e, img)
+      // 截图失败兜底
+      return this.renderListText(e, { title, subtitle, columns, rows, footer })
+    } catch (err) {
+      Logger.error(`渲染图片失败: ${err.message}，降级为文本`)
+      return this.renderListText(e, { title, subtitle, columns, rows, footer })
+    }
+  }
+
+  renderListText(e, { title, subtitle, columns, rows, footer }) {
+    const lines = rows.map(r => r.map((c, i) => `${columns[i]}: ${c}`).join('\n   '))
+    return reply(
+      e,
+      `📦 ${title} (${subtitle})\n\n${lines.join('\n\n')}\n\n${footer}`
+    )
+  }
+
+  buildListHtml({ title, subtitle, columns, rows, footer }) {
+    const headerCells = columns.map(c => `<th>${esc(c)}</th>`).join('')
+    const bodyRows = rows.map(r => {
+      const cells = r.map(c => `<td>${esc(c)}</td>`).join('')
+      return `<tr>${cells}</tr>`
+    }).join('')
+
+    return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    padding: 24px;
+    width: 760px;
+  }
+  .card {
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.2);
+    overflow: hidden;
+  }
+  .header {
+    padding: 24px 28px;
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    color: #fff;
+  }
+  .header .title {
+    font-size: 26px;
+    font-weight: 700;
+    margin-bottom: 6px;
+  }
+  .header .subtitle {
+    font-size: 14px;
+    opacity: 0.85;
+  }
+  .table-wrap {
+    padding: 20px 28px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th, td {
+    padding: 12px 10px;
+    text-align: left;
+    font-size: 14px;
+    border-bottom: 1px solid #f0f0f5;
+  }
+  th {
+    color: #888;
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  tr:last-child td { border-bottom: none; }
+  td:nth-child(1) { color: #888; width: 40px; }
+  td:nth-child(2) { font-weight: 600; color: #333; }
+  td:nth-child(4) { color: #666; font-size: 13px; }
+  .footer {
+    padding: 16px 28px 24px;
+    font-size: 13px;
+    color: #888;
+    border-top: 1px solid #f0f0f5;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="title">${esc(title)}</div>
+      <div class="subtitle">${esc(subtitle)}</div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>${headerCells}</tr>
+        </thead>
+        <tbody>
+          ${bodyRows}
+        </tbody>
+      </table>
+    </div>
+    <div class="footer">${esc(footer)}</div>
+  </div>
+</body>
+</html>`
   }
 
   // ===== 内部工具方法 =====
