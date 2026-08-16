@@ -155,12 +155,12 @@ export class PluginManager extends PluginBase {
       priority: 50,
       rule: [
         { reg: '^#?插件管理帮助$', fnc: 'showHelp' },
-        { reg: '^#?安装\\s+\\S', fnc: 'installPlugin' },
-        { reg: '^#?删除\\s+\\S', fnc: 'uninstallPlugin' },
-        { reg: '^#?更新插件\\s+\\S', fnc: 'updatePlugin' },
+        { reg: '^#?安装', fnc: 'installPlugin' },
+        { reg: '^#?删除', fnc: 'uninstallPlugin' },
+        { reg: '^#?更新插件', fnc: 'updatePlugin' },
         { reg: '^#?更新全部插件$', fnc: 'updateAllPlugins' },
         { reg: '^#?插件列表$', fnc: 'listPlugins' },
-        { reg: '^#?插件详情\\s+\\S', fnc: 'pluginDetail' },
+        { reg: '^#?插件详情', fnc: 'pluginDetail' },
         { reg: '^#?插件市场$', fnc: 'listPresetPlugins' },
         { reg: '^#?重载插件$', fnc: 'reloadPlugins' }
       ]
@@ -253,10 +253,19 @@ export class PluginManager extends PluginBase {
 
     const text = String(e?.msg ?? e?.raw_message ?? '')
     const name = text.replace(/^#?更新插件\s*/, '').trim()
-    if (!name) return reply(e, '请提供插件名称\n示例：#更新插件 miao-plugin')
+    if (!name) return reply(e, '请提供插件名称\n示例：#更新插件 miao-plugin\n示例：#更新插件 nidie')
 
-    const targetPath = this.findPluginPath(name)
-    if (!targetPath) return reply(e, `❌ 未找到插件「${name}」\n可发送 #插件列表 查看已安装插件`)
+    // 识别本插件（自我更新）
+    const selfNames = ['nidie', 'plugin-manager', path.basename(SELF_DIR)]
+    const isSelfUpdate = selfNames.includes(name) || this.isSelfRepoUrl(name)
+
+    let targetPath
+    if (isSelfUpdate) {
+      targetPath = SELF_DIR
+    } else {
+      targetPath = this.findPluginPath(name)
+      if (!targetPath) return reply(e, `❌ 未找到插件「${name}」\n可发送 #插件列表 查看已安装插件`)
+    }
 
     if (!fs.existsSync(path.join(targetPath, '.git'))) {
       return reply(e, `⚠️ 插件「${path.basename(targetPath)}」不是 git 仓库，无法更新`)
@@ -264,6 +273,10 @@ export class PluginManager extends PluginBase {
 
     this.taskLock = true
     try {
+      const isSelf = path.resolve(targetPath) === SELF_DIR
+      const label = isSelf ? '插件管理器 (本插件)' : path.basename(targetPath)
+
+      await reply(e, `⏳ 正在更新${isSelf ? '本插件' : `插件「${path.basename(targetPath)}」`}...`)
       const { stdout } = await execAsync('git pull', { cwd: targetPath })
       const output = (stdout || '').trim()
 
@@ -277,14 +290,25 @@ export class PluginManager extends PluginBase {
 
       this.taskLock = false
       if (/already up|up to date|已经是最新|没有内容更新/i.test(output)) {
-        return reply(e, `✅ 插件「${path.basename(targetPath)}」已是最新版本${depMsg}`)
+        return reply(e, `✅ ${label} 已是最新版本${depMsg}`)
       }
-      return reply(e, `✅ 插件「${path.basename(targetPath)}」更新成功\n${output}${depMsg}\n💡 发送 #重载插件 即可生效`)
+      return reply(e, `✅ ${label} 更新成功\n${output}${depMsg}\n💡 发送 #重载插件 即可生效`)
     } catch (err) {
       this.taskLock = false
       Logger.error(`更新失败: ${err.stack || err}`)
       return reply(e, `❌ 插件更新失败：${err.message}`)
     }
+  }
+
+  // 判断输入是否是本插件的仓库 URL
+  isSelfRepoUrl(input) {
+    if (!input || typeof input !== 'string') return false
+    const SELF_REPO_PATTERNS = [
+      /github\.com[/:]nidie2580\/nidie/i,
+      /gitee\.com[/:]nidie2580\/nidie/i,
+      /^nidie2580\/nidie$/i
+    ]
+    return SELF_REPO_PATTERNS.some(re => re.test(input))
   }
 
   async updateAllPlugins(e) {
