@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    padding: 24px;
+    width: 760px;
+    color: #333;
+  }
+  .card {
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.2);
+    overflow: hidden;
+  }
+  .header {
+    padding: 24px 28px;
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    color: #fff;
+  }
+  .header .title {
+    font-size: 26px;
+    font-weight: 700;
+    margin-bottom: 6px;
+  }
+  .header .subtitle {
+    font-size: 14px;
+    opacity: 0.85;
+  }
+  .table-wrap {
+    padding: 20px 28px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th, td {
+    padding: 12px 10px;
+    text-align: left;
+    font-size: 14px;
+    border-bottom: 1px solid #f0f0f5;
+    vertical-align: top;
+  }
+  th {
+    color: #888;
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  tr:last-child td { border-bottom: none; }
+  td.url {
+    color: #666;
+    font-size: 12px;
+    word-break: break-all;
+    line-height: 1.4;
+  }
+  td.status.done { color: #10b981; }
+  td.status.todo { color: #9ca3af; }
+  .footer {
+    padding: 16px 28px 24px;
+    font-size: 13px;
+    color: #888;
+    border-top: 1px solid #f0f0f5;
+  }
+  .tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 12px;
+    background: #eef2ff;
+    color: #6366f1;
+  }
+  .tag.git { background: #ecfdf5; color: #10b981; }
+  .tag.local { background: #fef3c7; color: #d97706; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="title">{{=title}}</div>
+      <div class="subtitle">{{=subtitle}}</div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+          {{each columns col i}}
+            <th>{{=col}}</th>
+          {{/each}}
+          </tr>
+        </thead>
+        <tbody>
+          {{each rows row r}}
+          <tr>
+            {{each row cell c}}
+              {{if columns[c] === '类型'}}
+              <td><span class="tag {{if cell === 'git'}}git{{else}}local{{/if}}">{{=cell}}</span></td>
+              {{else if columns[c] === '状态'}}
+              <td class="status {{if /已安装|done|✅/.test(cell)}}done{{else}}todo{{/if}}">{{=cell}}</td>
+              {{else if columns[c] === '仓库地址' || columns[c] === '路径'}}
+              <td class="url">{{=cell}}</td>
+              {{else}}
+              <td>{{=cell}}</td>
+              {{/if}}
+            {{/each}}
+          </tr>
+          {{/each}}
+        </tbody>
+      </table>
+    </div>
+    <div class="footer">{{=footer}}</div>
+  </div>
+</body>
+</html>

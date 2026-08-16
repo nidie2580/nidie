@@ -85,7 +85,49 @@ if (!Puppeteer) {
 if (Puppeteer) {
   try { Logger.mark(`[nidie] puppeteer 加载成功 (路径或全局)` ) } catch (_) {}
 } else {
-  try { Logger.warn(`[nidie] 未找到 puppeteer，列表/市场将降级为文本输出` ) } catch (_) {}
+  try { Logger.warn(`[nidie] 未找到 puppeteer，将尝试 Renderer 或降级文本输出` ) } catch (_) {}
+}
+
+// 兼容 TRSS / Miao-TRSS 等分支使用的 Renderer.render() 模板渲染系统
+let Renderer = null
+const RENDERER_PATHS = [
+  '../../lib/renderer/renderer.js',
+  '../../../lib/renderer/renderer.js',
+  `${process.cwd()}/lib/renderer/renderer.js`,
+  '../../utils/renderer.js',
+  '../../../utils/renderer.js',
+  `${process.cwd()}/utils/renderer.js`
+]
+
+// 1) 先全局查找
+if (typeof globalThis.Renderer !== 'undefined') {
+  Renderer = globalThis.Renderer
+} else if (typeof Renderer !== 'undefined') {
+  Renderer = Renderer  // eslint-disable-line
+} else if (globalThis.runtime?.Renderer) {
+  Renderer = globalThis.runtime.Renderer
+}
+
+// 2) 再 import
+if (!Renderer) {
+  for (const p of RENDERER_PATHS) {
+    try {
+      const mod = await import(p)
+      if (mod?.default?.render) {
+        Renderer = mod.default
+        break
+      } else if (mod?.render) {
+        Renderer = mod
+        break
+      }
+    } catch (_) { /* 继续 */ }
+  }
+}
+
+if (Renderer) {
+  try { Logger.mark(`[nidie] Renderer 加载成功` ) } catch (_) {}
+} else {
+  try { Logger.warn(`[nidie] 未加载 Renderer` ) } catch (_) {}
 }
 
 const execAsync = promisify(exec)
@@ -466,59 +508,89 @@ export class PluginManager extends PluginBase {
   // ===== 图片渲染 =====
 
   async renderListImage(e, { title, subtitle, columns, rows, footer }) {
-    // 没有 puppeteer 时降级为纯文本
-    if (!Puppeteer || typeof Puppeteer.screenshot !== 'function') {
-      Logger.warn(`[nidie] puppeteer 不可用 (${!Puppeteer ? '未加载' : '无 screenshot 方法'})，降级文本`)
-      return this.renderListText(e, { title, subtitle, columns, rows, footer })
-    }
-
-    const html = this.buildListHtml({ title, subtitle, columns, rows, footer })
     Logger.mark(`[nidie] 开始渲染图片: ${title}`)
 
-    // 临时 HTML 文件路径（部分 Yunzai 版本要求 html 是文件路径）
-    const htmlPath = path.join(SELF_DIR, `.render_${Date.now()}.html`)
-    try {
-      // 尝试多种 screenshot 调用签名，兼容不同 Yunzai 版本
-      const callArgs = [
-        // 1) Yunzai 标准：screenshot(name, { html })
-        () => Puppeteer.screenshot('plugin-manager', { html }),
-        // 2) 老版本：screenshot(html, options)
-        () => Puppeteer.screenshot(html, {}),
-        // 3) 直接传文件路径
-        () => {
-          fs.writeFileSync(htmlPath, html, 'utf-8')
-          return Puppeteer.screenshot('plugin-manager', { file: htmlPath, html })
-        },
-        // 4) 不传 name，只传 options
-        () => Puppeteer.screenshot({ html })
+    const data = { title, subtitle, columns, rows, footer }
+
+    // 方案 1：Renderer.render (TRSS 分支最标准的图片渲染方式，支持 file 监听器)
+    if (Renderer && typeof Renderer.render === 'function') {
+      const renderers = [
+        // 标准：模板名 = 插件名/模板名（resources/apps 下）
+        () => Renderer.render('plugin-manager/list', {
+          data,
+          name: 'plugin-manager/list',
+          // 有些版本从 app.path 找模板，给绝对路径兜底
+          file: path.join(SELF_DIR, 'resources', 'apps', 'list.html'),
+          plugin: SELF_DIR
+        }),
+        // 旧签名：Renderer.render(templateName, data)
+        () => Renderer.render('plugin-manager/list', data),
+        // renderer.render({ tpl, data, pageGoto })  — 传绝对模板路径
+        () => Renderer.render({
+          tpl: path.join(SELF_DIR, 'resources', 'apps', 'list.html'),
+          data,
+          name: 'plugin-manager'
+        })
       ]
 
-      let img = null
-      let lastErr = null
-      for (let i = 0; i < callArgs.length; i++) {
+      for (let i = 0; i < renderers.length; i++) {
         try {
-          img = await callArgs[i]()
+          const img = await renderers[i]()
           if (img) {
-            Logger.mark(`[nidie] 截图成功，方式 ${i + 1}`)
-            break
+            Logger.mark(`[nidie] Renderer 方式 ${i + 1} 成功`)
+            return reply(e, img)
           }
         } catch (err) {
-          lastErr = err
-          Logger.warn(`[nidie] 截图方式 ${i + 1} 失败: ${err.message}`)
+          Logger.warn(`[nidie] Renderer 方式 ${i + 1} 失败: ${err.message}`)
         }
       }
-
-      if (img) return reply(e, img)
-
-      Logger.error(`[nidie] 所有截图方式均失败，降级文本。最后错误: ${lastErr?.message || '无'}`)
-      return this.renderListText(e, { title, subtitle, columns, rows, footer })
-    } catch (err) {
-      Logger.error(`[nidie] 渲染图片失败: ${err.stack || err.message}，降级文本`)
-      return this.renderListText(e, { title, subtitle, columns, rows, footer })
-    } finally {
-      // 清理临时文件
-      try { if (fs.existsSync(htmlPath)) fs.unlinkSync(htmlPath) } catch (_) {}
+      Logger.warn(`[nidie] Renderer 全部失败，尝试 puppeteer`)
     }
+
+    // 方案 2：puppeteer.screenshot (原版 Yunzai)
+    if (Puppeteer && typeof Puppeteer.screenshot === 'function') {
+      const html = this.buildListHtml(data)
+      const htmlPath = path.join(SELF_DIR, `.render_${Date.now()}.html`)
+      try {
+        const ss = [
+          // 方案 2a: Renderer 风格传模板路径给 puppeteer
+          () => Puppeteer.screenshot('plugin-manager/list', {
+            data,
+            file: path.join(SELF_DIR, 'resources', 'apps', 'list.html')
+          }),
+          // 方案 2b: 直接传整段 html (部分分支支持)
+          () => Puppeteer.screenshot('plugin-manager', { html }),
+          // 方案 2c: 写文件 + 文件方式
+          () => {
+            fs.writeFileSync(htmlPath, html, 'utf-8')
+            return Puppeteer.screenshot('plugin-manager', { file: htmlPath, html })
+          },
+          // 方案 2d: 只传 html
+          () => Puppeteer.screenshot({ html })
+        ]
+
+        let lastErr = null
+        for (let i = 0; i < ss.length; i++) {
+          try {
+            const img = await ss[i]()
+            if (img) {
+              Logger.mark(`[nidie] puppeteer 方式 ${i + 1} 成功`)
+              return reply(e, img)
+            }
+          } catch (err) {
+            lastErr = err
+            Logger.warn(`[nidie] puppeteer 方式 ${i + 1} 失败: ${err.message}`)
+          }
+        }
+        Logger.error(`[nidie] puppeteer 全部失败。最后错误: ${lastErr?.message || '无'}`)
+      } finally {
+        try { if (fs.existsSync(htmlPath)) fs.unlinkSync(htmlPath) } catch (_) {}
+      }
+    }
+
+    // 方案 3：纯文本兜底
+    Logger.warn(`[nidie] 所有渲染路径均失败，降级文本`)
+    return this.renderListText(e, data)
   }
 
   renderListText(e, { title, subtitle, columns, rows, footer }) {
