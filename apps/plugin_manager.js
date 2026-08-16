@@ -82,10 +82,43 @@ if (!Puppeteer) {
   } catch (_) {}
 }
 
+// 额外：保存原始的 npm puppeteer 包引用（用于自己开 page 截图），
+// 以及 browser WSR（Yunzai 已启动的 chromium），避免重复开进程。
+let RawPuppeteer = null
+let BrowserWSR = null
+
+// 4) 直接 import 已安装的 puppeteer npm 包，并尝试获取 browser WSR
+if (!Puppeteer || true) {   // 就算已经有全局 Puppeteer，也找一下 rawPuppeteer + WSR
+  // puppeteer 包本身
+  for (const p of ['puppeteer', `${process.cwd()}/node_modules/puppeteer`, `${process.cwd()}/node_modules/puppeteer/lib/cjs/puppeteer/puppeteer.js`]) {
+    try {
+      const mod = await import(p)
+      if (mod?.default?.launch) RawPuppeteer = mod.default
+      else if (mod?.launch) RawPuppeteer = mod
+      if (RawPuppeteer) break
+    } catch (_) {}
+  }
+  // browser WSR 或 browser 实例
+  for (const getter of [
+    () => globalThis.browser?.wsEndpoint,
+    () => globalThis.browserWSEndpoint,
+    () => globalThis.puppeteer?.browserWSEndpoint,
+    () => typeof puppeteer !== 'undefined' ? puppeteer.browserWSEndpoint : undefined,
+    () => globalThis.runtime?.browserWSEndpoint,
+    () => Puppeteer?.browserWSEndpoint,
+    () => Puppeteer?.browser?.wsEndpoint?.()
+  ]) {
+    try {
+      const v = getter()
+      if (typeof v === 'string' && v.startsWith('ws://')) { BrowserWSR = v; break }
+    } catch (_) {}
+  }
+}
+
 if (Puppeteer) {
-  try { Logger.mark(`[nidie] puppeteer 加载成功 (路径或全局)` ) } catch (_) {}
+  try { Logger.mark(`[nidie] puppeteer 加载成功 (路径或全局); raw=${!!RawPuppeteer}; wsr=${!!BrowserWSR}` ) } catch (_) {}
 } else {
-  try { Logger.warn(`[nidie] 未找到 puppeteer，将尝试 Renderer 或降级文本输出` ) } catch (_) {}
+  try { Logger.warn(`[nidie] 未找到 puppeteer，将尝试 Renderer 或降级文本输出 (raw=${!!RawPuppeteer}; wsr=${!!BrowserWSR})` ) } catch (_) {}
 }
 
 // 兼容 TRSS / Miao-TRSS 等分支使用的 Renderer.render() 模板渲染系统
@@ -735,87 +768,115 @@ export class PluginManager extends PluginBase {
 
   async renderListImage(e, { title, subtitle, columns, rows, footer }) {
     Logger.mark(`[nidie] 开始渲染图片: ${title}`)
-
     const data = { title, subtitle, columns, rows, footer }
-
-    // 方案 1：Renderer.render (TRSS 分支最标准的图片渲染方式，支持 file 监听器)
-    if (Renderer && typeof Renderer.render === 'function') {
-      const renderers = [
-        // 标准：模板名 = 插件名/模板名（resources/apps 下）
-        () => Renderer.render('plugin-manager/list', {
-          data,
-          name: 'plugin-manager/list',
-          // 有些版本从 app.path 找模板，给绝对路径兜底
-          file: path.join(SELF_DIR, 'resources', 'apps', 'list.html'),
-          plugin: SELF_DIR
-        }),
-        // 旧签名：Renderer.render(templateName, data)
-        () => Renderer.render('plugin-manager/list', data),
-        // renderer.render({ tpl, data, pageGoto })  — 传绝对模板路径
-        () => Renderer.render({
-          tpl: path.join(SELF_DIR, 'resources', 'apps', 'list.html'),
-          data,
-          name: 'plugin-manager'
-        })
-      ]
-
-      for (let i = 0; i < renderers.length; i++) {
-        try {
-          const img = await renderers[i]()
-          if (img) {
-            Logger.mark(`[nidie] Renderer 方式 ${i + 1} 成功`)
-            return reply(e, img)
-          }
-        } catch (err) {
-          Logger.warn(`[nidie] Renderer 方式 ${i + 1} 失败: ${err.message}`)
-        }
-      }
-      Logger.warn(`[nidie] Renderer 全部失败，尝试 puppeteer`)
+    const html = this.buildListHtml(data)
+    const htmlPath = path.join(SELF_DIR, `.render_${Date.now()}.html`)
+    let lastErr = null
+    const recordErr = (label, err) => {
+      lastErr = err
+      if (err?.stack) Logger.warn(`[nidie] ${label} 失败:\n${err.stack}`)
+      else Logger.warn(`[nidie] ${label} 失败: ${err?.message || String(err)}`)
     }
 
-    // 方案 2：puppeteer.screenshot (原版 Yunzai)
-    if (Puppeteer && typeof Puppeteer.screenshot === 'function') {
-      const html = this.buildListHtml(data)
-      const htmlPath = path.join(SELF_DIR, `.render_${Date.now()}.html`)
+    // ====== 方案 0：最直接 —— 用 RawPuppeteer 连已有的 BrowserWSR 自己开 page 截图 ======
+    // 完全绕开 Renderer / Puppeteer.screenshot 这些封装层，最可靠
+    if (RawPuppeteer) {
+      let page = null
+      let browser = null
       try {
-        const ss = [
-          // 方案 2a: Renderer 风格传模板路径给 puppeteer
-          () => Puppeteer.screenshot('plugin-manager/list', {
-            data,
-            file: path.join(SELF_DIR, 'resources', 'apps', 'list.html')
-          }),
-          // 方案 2b: 直接传整段 html (部分分支支持)
-          () => Puppeteer.screenshot('plugin-manager', { html }),
-          // 方案 2c: 写文件 + 文件方式
-          () => {
-            fs.writeFileSync(htmlPath, html, 'utf-8')
-            return Puppeteer.screenshot('plugin-manager', { file: htmlPath, html })
-          },
-          // 方案 2d: 只传 html
-          () => Puppeteer.screenshot({ html })
-        ]
-
-        let lastErr = null
-        for (let i = 0; i < ss.length; i++) {
-          try {
-            const img = await ss[i]()
-            if (img) {
-              Logger.mark(`[nidie] puppeteer 方式 ${i + 1} 成功`)
-              return reply(e, img)
-            }
-          } catch (err) {
-            lastErr = err
-            Logger.warn(`[nidie] puppeteer 方式 ${i + 1} 失败: ${err.message}`)
+        if (BrowserWSR) {
+          // 复用 Yunzai 已启动的 chromium（从日志看端口是 44793，就是它）
+          Logger.mark(`[nidie] 连接已有浏览器: ${BrowserWSR.slice(0, 40)}...`)
+          browser = await RawPuppeteer.connect({ browserWSEndpoint: BrowserWSR })
+        } else if (RawPuppeteer.connect && Puppeteer?.browserWSEndpoint) {
+          browser = await RawPuppeteer.connect({ browserWSEndpoint: Puppeteer.browserWSEndpoint })
+        } else if (typeof RawPuppeteer.launch === 'function') {
+          // 最后兜底自己起一个（耗时长一些，但一定能行）
+          Logger.mark(`[nidie] 独立启动 puppeteer chromium (备用方案)`)
+          browser = await RawPuppeteer.launch({
+            headless: 'new',
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu']
+          })
+        }
+        if (browser) {
+          // 把 HTML 写盘 → goto file://，绕过所有模板渲染逻辑
+          fs.writeFileSync(htmlPath, html, 'utf-8')
+          const fileUrl = 'file://' + htmlPath.replace(/\\/g, '/')
+          page = await browser.newPage()
+          await page.setViewport({ width: 800, deviceScaleFactor: 2 })
+          await page.goto(fileUrl, { waitUntil: 'networkidle0', timeout: 20000 })
+          // 按内容取完整高度
+          const { height } = await page.evaluate(() => ({
+            height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
+          }))
+          const img = await page.screenshot({
+            type: 'png',
+            clip: { x: 0, y: 0, width: 800, height: Math.max(height, 300) }
+          })
+          if (img) {
+            Logger.mark(`[nidie] 直连 puppeteer page 截图成功 (${img.length} 字节)`)
+            return reply(e, img)
           }
         }
-        Logger.error(`[nidie] puppeteer 全部失败。最后错误: ${lastErr?.message || '无'}`)
+      } catch (err) {
+        recordErr('直连 puppeteer page 方案', err)
       } finally {
+        try { if (page) await page.close().catch(() => {}) } catch (_) {}
+        // 不关闭 browser（如果是复用的），只关自己开的
+        try { if (browser && !BrowserWSR) await browser.close().catch(() => {}) } catch (_) {}
         try { if (fs.existsSync(htmlPath)) fs.unlinkSync(htmlPath) } catch (_) {}
       }
     }
 
-    // 方案 3：纯文本兜底
-    Logger.warn(`[nidie] 所有渲染路径均失败，降级文本`)
+    // ====== 方案 1：Renderer.render (TRSS 分支模板渲染) ======
+    if (Renderer && typeof Renderer.render === 'function') {
+      const renderers = [
+        () => Renderer.render('plugin-manager/list', {
+          data, name: 'plugin-manager/list',
+          file: path.join(SELF_DIR, 'resources', 'apps', 'list.html'),
+          plugin: SELF_DIR
+        }),
+        () => Renderer.render('plugin-manager/list', data),
+        () => Renderer.render({
+          tpl: path.join(SELF_DIR, 'resources', 'apps', 'list.html'),
+          data, name: 'plugin-manager'
+        })
+      ]
+      for (let i = 0; i < renderers.length; i++) {
+        try {
+          const img = await renderers[i]()
+          if (img) { Logger.mark(`[nidie] Renderer 方式 ${i + 1} 成功`); return reply(e, img) }
+        } catch (err) { recordErr(`Renderer 方式 ${i + 1}`, err) }
+      }
+      Logger.warn(`[nidie] Renderer 全部失败，尝试 Puppeteer.screenshot`)
+    }
+
+    // ====== 方案 2：puppeteer.screenshot (原版 Yunzai 封装) ======
+    if (Puppeteer && typeof Puppeteer.screenshot === 'function') {
+      const tmpHtml2 = path.join(SELF_DIR, `.render2_${Date.now()}.html`)
+      try {
+        const ss = [
+          () => Puppeteer.screenshot('plugin-manager/list', {
+            data, file: path.join(SELF_DIR, 'resources', 'apps', 'list.html')
+          }),
+          () => Puppeteer.screenshot('plugin-manager', { html }),
+          () => { fs.writeFileSync(tmpHtml2, html, 'utf-8'); return Puppeteer.screenshot('plugin-manager', { file: tmpHtml2, html }) },
+          () => Puppeteer.screenshot({ html })
+        ]
+        for (let i = 0; i < ss.length; i++) {
+          try {
+            const img = await ss[i]()
+            if (img) { Logger.mark(`[nidie] puppeteer.screenshot 方式 ${i + 1} 成功`); return reply(e, img) }
+          } catch (err) { recordErr(`puppeteer.screenshot ${i + 1}`, err) }
+        }
+      } finally {
+        try { if (fs.existsSync(tmpHtml2)) fs.unlinkSync(tmpHtml2) } catch (_) {}
+      }
+    }
+
+    // ====== 方案 3：文本兜底 ======
+    if (lastErr) Logger.error(`[nidie] 所有渲染路径失败（lastErr=${lastErr?.message || lastErr || '无'}），降级文本`)
+    else Logger.warn(`[nidie] 所有渲染路径失败，降级文本`)
     return this.renderListText(e, data)
   }
 
