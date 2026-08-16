@@ -83,31 +83,82 @@ if (!Puppeteer) {
 }
 
 // 额外：保存原始的 npm puppeteer 包引用（用于自己开 page 截图），
-// 以及 browser WSR（Yunzai 已启动的 chromium），避免重复开进程。
+// 以及已启动的 browser 对象（优先直接用实例，不需要 WSR 字符串）
 let RawPuppeteer = null
 let BrowserWSR = null
+let SharedBrowser = null   // 直接可用的 browser 实例（优先级最高）
 
-// 4) 直接 import 已安装的 puppeteer npm 包，并尝试获取 browser WSR
-if (!Puppeteer || true) {   // 就算已经有全局 Puppeteer，也找一下 rawPuppeteer + WSR
-  // puppeteer 包本身
-  for (const p of ['puppeteer', `${process.cwd()}/node_modules/puppeteer`, `${process.cwd()}/node_modules/puppeteer/lib/cjs/puppeteer/puppeteer.js`]) {
-    try {
-      const mod = await import(p)
-      if (mod?.default?.launch) RawPuppeteer = mod.default
-      else if (mod?.launch) RawPuppeteer = mod
-      if (RawPuppeteer) break
-    } catch (_) {}
-  }
-  // browser WSR 或 browser 实例
-  for (const getter of [
+// 4) 直接 import 已安装的 puppeteer npm 包
+for (const p of ['puppeteer', `${process.cwd()}/node_modules/puppeteer`, `${process.cwd()}/node_modules/puppeteer/lib/cjs/puppeteer/puppeteer.js`]) {
+  try {
+    const mod = await import(p)
+    if (mod?.default?.launch) RawPuppeteer = mod.default
+    else if (mod?.launch) RawPuppeteer = mod
+    if (RawPuppeteer) break
+  } catch (_) {}
+}
+
+// 5) 兜底：try require (ESM/CJS双兼容：import 失败用 createRequire + node_modules 绝对路径)
+if (!RawPuppeteer) {
+  try {
+    const { createRequire } = await import('module')
+    const req = createRequire(`${process.cwd()}/lib/index.js`)
+    const r = req.resolve('puppeteer')
+    if (r) {
+      const m = req(r)
+      if (m?.launch) RawPuppeteer = m
+      else if (m?.default?.launch) RawPuppeteer = m.default
+    }
+  } catch (_) {}
+}
+
+// 6) 获取 SharedBrowser：直接拿到 PuppeteerRenderer 内部已经 newPage 的那个 Browser 实例
+//    从 20+ 可能的挂载位置逐个取
+const browserGetters = [
+  // 直接有 browser 对象（最完美）
+  () => globalThis.browser,
+  () => globalThis.puppeteer?.browser,
+  () => typeof puppeteer !== 'undefined' ? puppeteer.browser : undefined,
+  () => Puppeteer?.browser,
+  () => Renderer?.browser,
+  () => globalThis.runtime?.browser,
+  () => globalThis.Bot?.browser,
+  () => globalThis.PuppeteerRenderer?.browser,
+  // browser 放在 renderer 里
+  () => globalThis.renderer?.browser,
+  () => Renderer?.renderer?.browser,
+  // PuppeteerRenderer 单例
+  () => globalThis.PuppeteerRenderer,
+  () => Puppeteer?.PuppeteerRenderer
+]
+for (const getter of browserGetters) {
+  try {
+    const b = getter()
+    // 判定标准：有 newPage / close 方法
+    if (b && typeof b.newPage === 'function' && typeof b.close === 'function') {
+      SharedBrowser = b
+      break
+    }
+  } catch (_) {}
+}
+
+// 7) 拿不到 SharedBrowser 才退一步找 WSR 字符串
+if (!SharedBrowser) {
+  const wsrGetters = [
     () => globalThis.browser?.wsEndpoint,
     () => globalThis.browserWSEndpoint,
     () => globalThis.puppeteer?.browserWSEndpoint,
     () => typeof puppeteer !== 'undefined' ? puppeteer.browserWSEndpoint : undefined,
     () => globalThis.runtime?.browserWSEndpoint,
     () => Puppeteer?.browserWSEndpoint,
-    () => Puppeteer?.browser?.wsEndpoint?.()
-  ]) {
+    () => Puppeteer?.browser?.wsEndpoint?.(),
+    // Renderer / PuppeteerRenderer
+    () => Renderer?.browserWSEndpoint,
+    () => Renderer?.browser?.wsEndpoint?.(),
+    () => globalThis.PuppeteerRenderer?.browser?.wsEndpoint?.(),
+    () => globalThis.renderer?.browserWSEndpoint
+  ]
+  for (const getter of wsrGetters) {
     try {
       const v = getter()
       if (typeof v === 'string' && v.startsWith('ws://')) { BrowserWSR = v; break }
@@ -116,9 +167,9 @@ if (!Puppeteer || true) {   // 就算已经有全局 Puppeteer，也找一下 ra
 }
 
 if (Puppeteer) {
-  try { Logger.mark(`[nidie] puppeteer 加载成功 (路径或全局); raw=${!!RawPuppeteer}; wsr=${!!BrowserWSR}` ) } catch (_) {}
+  try { Logger.mark(`[nidie] puppeteer 加载成功; raw=${!!RawPuppeteer}; sharedBrowser=${!!SharedBrowser}; wsr=${!!BrowserWSR}` ) } catch (_) {}
 } else {
-  try { Logger.warn(`[nidie] 未找到 puppeteer，将尝试 Renderer 或降级文本输出 (raw=${!!RawPuppeteer}; wsr=${!!BrowserWSR})` ) } catch (_) {}
+  try { Logger.warn(`[nidie] 未找到 puppeteer，将尝试 Renderer 或降级 (raw=${!!RawPuppeteer}; sharedBrowser=${!!SharedBrowser}; wsr=${!!BrowserWSR})` ) } catch (_) {}
 }
 
 // 兼容 TRSS / Miao-TRSS 等分支使用的 Renderer.render() 模板渲染系统
@@ -778,54 +829,66 @@ export class PluginManager extends PluginBase {
       else Logger.warn(`[nidie] ${label} 失败: ${err?.message || String(err)}`)
     }
 
-    // ====== 方案 0：最直接 —— 用 RawPuppeteer 连已有的 BrowserWSR 自己开 page 截图 ======
-    // 完全绕开 Renderer / Puppeteer.screenshot 这些封装层，最可靠
-    if (RawPuppeteer) {
+    // ====== 方案 0：直接用 browser 实例开 page，绕开所有 Yunzai 封装层 ======
+    // 0a. SharedBrowser（直接拿到浏览器实例，优先级最高）
+    // 0b. BrowserWSR → RawPuppeteer.connect
+    // 0c. RawPuppeteer.launch 自己开一个（兜底）
+    let htmlTmpCreated = false
+    if (SharedBrowser || RawPuppeteer || BrowserWSR) {
       let page = null
       let browser = null
+      let weStartedBrowser = false
       try {
-        if (BrowserWSR) {
-          // 复用 Yunzai 已启动的 chromium（从日志看端口是 44793，就是它）
-          Logger.mark(`[nidie] 连接已有浏览器: ${BrowserWSR.slice(0, 40)}...`)
+        if (SharedBrowser) {
+          Logger.mark(`[nidie] 截图方案 0a: 使用共享 browser 实例`)
+          browser = SharedBrowser
+        } else if (RawPuppeteer && BrowserWSR) {
+          Logger.mark(`[nidie] 截图方案 0b: connect WSR=${BrowserWSR.slice(0, 40)}...`)
           browser = await RawPuppeteer.connect({ browserWSEndpoint: BrowserWSR })
-        } else if (RawPuppeteer.connect && Puppeteer?.browserWSEndpoint) {
-          browser = await RawPuppeteer.connect({ browserWSEndpoint: Puppeteer.browserWSEndpoint })
-        } else if (typeof RawPuppeteer.launch === 'function') {
-          // 最后兜底自己起一个（耗时长一些，但一定能行）
-          Logger.mark(`[nidie] 独立启动 puppeteer chromium (备用方案)`)
+        } else if (RawPuppeteer && typeof RawPuppeteer.launch === 'function') {
+          Logger.mark(`[nidie] 截图方案 0c: 独立启动 puppeteer chromium`)
           browser = await RawPuppeteer.launch({
             headless: 'new',
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu']
           })
+          weStartedBrowser = true
+        } else {
+          Logger.warn(`[nidie] 方案 0 跳过: 无可用于启动 browser 的条件 (raw=${!!RawPuppeteer}, shared=${!!SharedBrowser}, wsr=${!!BrowserWSR})`)
         }
         if (browser) {
-          // 把 HTML 写盘 → goto file://，绕过所有模板渲染逻辑
           fs.writeFileSync(htmlPath, html, 'utf-8')
+          htmlTmpCreated = true
           const fileUrl = 'file://' + htmlPath.replace(/\\/g, '/')
+          Logger.mark(`[nidie] 加载本地 HTML: ${fileUrl.slice(0, 80)}`)
           page = await browser.newPage()
           await page.setViewport({ width: 800, deviceScaleFactor: 2 })
-          await page.goto(fileUrl, { waitUntil: 'networkidle0', timeout: 20000 })
-          // 按内容取完整高度
+          await page.goto(fileUrl, { waitUntil: 'domcontentloaded', timeout: 25000 })
+          await new Promise(r => setTimeout(r, 300))  // 等 CSS 渲染
           const { height } = await page.evaluate(() => ({
-            height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
+            height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, 300)
           }))
           const img = await page.screenshot({
             type: 'png',
-            clip: { x: 0, y: 0, width: 800, height: Math.max(height, 300) }
+            fullPage: false,
+            clip: { x: 0, y: 0, width: 800, height }
           })
           if (img) {
-            Logger.mark(`[nidie] 直连 puppeteer page 截图成功 (${img.length} 字节)`)
+            const len = Buffer.isBuffer(img) ? img.length : (typeof img === 'string' ? img.length : 0)
+            Logger.mark(`[nidie] 方案 0 截图成功 (${len} 字节)`)
             return reply(e, img)
+          } else {
+            Logger.warn(`[nidie] 方案 0 screenshot 返回空值: ${typeof img}`)
           }
         }
       } catch (err) {
-        recordErr('直连 puppeteer page 方案', err)
+        recordErr('方案0(直连puppeteer page)', err)
       } finally {
-        try { if (page) await page.close().catch(() => {}) } catch (_) {}
-        // 不关闭 browser（如果是复用的），只关自己开的
-        try { if (browser && !BrowserWSR) await browser.close().catch(() => {}) } catch (_) {}
-        try { if (fs.existsSync(htmlPath)) fs.unlinkSync(htmlPath) } catch (_) {}
+        try { if (page && !SharedBrowser) await page.close().catch(() => {}) } catch (_) {}
+        try { if (weStartedBrowser && browser) await browser.close().catch(() => {}) } catch (_) {}
+        try { if (htmlTmpCreated && fs.existsSync(htmlPath)) fs.unlinkSync(htmlPath) } catch (_) {}
       }
+    } else {
+      Logger.warn(`[nidie] 方案 0 整体跳过：未获取到任何可用于截图的 browser/wsr/raw 能力`)
     }
 
     // ====== 方案 1：Renderer.render (TRSS 分支模板渲染) ======
