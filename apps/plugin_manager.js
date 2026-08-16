@@ -132,8 +132,64 @@ if (Renderer) {
 
 const execAsync = promisify(exec)
 
+// ===== 超时配置（毫秒）=====
+const TIMEOUT = {
+  // 克隆仓库：10 分钟（拉取慢时卡最久的一步）
+  GIT_CLONE: 10 * 60 * 1000,
+  // 拉取远程 / 更新：5 分钟
+  GIT_PULL: 5 * 60 * 1000,
+  // 安装依赖：15 分钟（pnpm/npm 有时很慢）
+  NPM_INSTALL: 15 * 60 * 1000
+}
+
 const PLUGINS_DIR = path.resolve(process.cwd(), 'plugins')
 const SELF_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
+/**
+ * 带超时 & 进程树清理的 exec 封装
+ * @param {string} cmd  执行的 shell 命令
+ * @param {object} opts exec 参数（cwd、maxBuffer 等）
+ * @param {number} timeoutMs 超时毫秒
+ * @param {string} stepName 用于日志显示的步骤名
+ * @returns {Promise<{stdout:string, stderr:string}>}
+ */
+function execWithTimeout(cmd, opts, timeoutMs, stepName) {
+  return new Promise((resolve, reject) => {
+    const child = exec(cmd, opts, (err, stdout, stderr) => {
+      if (timeoutRef) clearTimeout(timeoutRef)
+      if (killed) return
+      if (err) return reject(err)
+      resolve({ stdout: stdout || '', stderr: stderr || '' })
+    })
+
+    let killed = false
+    const timeoutRef = setTimeout(() => {
+      killed = true
+      // 先温柔 SIGTERM，1.5s 后 SIGKILL，并杀整组进程
+      try {
+        const pid = child.pid
+        Logger.warn(`[nidie] ${stepName} 超时 (${(timeoutMs / 1000 / 60).toFixed(1)} 分钟)，正在中止 (pid=${pid})`)
+        // 杀整个进程组（父进程 + 子进程 git/npm 等）
+        try {
+          if (pid) process.kill(-pid, 'SIGTERM')
+        } catch (_) {
+          try { if (pid) child.kill('SIGTERM') } catch (__) {}
+        }
+        // 1.5s 后强杀
+        setTimeout(() => {
+          try {
+            if (pid) process.kill(-pid, 'SIGKILL')
+          } catch (_) {
+            try { if (pid) child.kill('SIGKILL') } catch (__) {}
+          }
+        }, 1500).unref?.()
+      } catch (_) {}
+      reject(new Error(`${stepName} 超时 (${(timeoutMs / 1000 / 60).toFixed(1)} 分钟未完成)`))
+    }, timeoutMs)
+    // 如果 Promise 被外层 unref，timeout 也不阻塞进程
+    timeoutRef.unref?.()
+  })
+}
 
 const PRESET_PLUGINS = {
   'ws-plugin': 'https://gitee.com/xiaoye12123/ws-plugin.git',
@@ -232,13 +288,31 @@ export class PluginManager extends PluginBase {
 
     this.taskLock = true
     try {
-      await reply(e, `⏳ 正在安装插件「${dirName}」...\n仓库地址：${repoUrl}\n请耐心等待，安装过程可能需要一些时间`)
+      await reply(e,
+        `⏳ 正在安装插件「${dirName}」...\n` +
+        `仓库地址：${repoUrl}\n` +
+        `⏱️ 每步超时：克隆 ${(TIMEOUT.GIT_CLONE / 60000).toFixed(0)} 分钟 / 依赖 ${(TIMEOUT.NPM_INSTALL / 60000).toFixed(0)} 分钟\n` +
+        `请耐心等待，超时后会自动中止并回滚`
+      )
 
-      await reply(e, `📦 [1/3] 正在克隆仓库...`)
-      await this.gitClone(repoUrl, targetPath)
+      let timeouted = false
+      await reply(e, `📦 [1/3] 正在克隆仓库... (最长 ${(TIMEOUT.GIT_CLONE / 60000).toFixed(0)} 分钟)`)
+      try {
+        await this.gitClone(repoUrl, targetPath)
+      } catch (err) {
+        if (/超时/.test(err.message)) timeouted = true
+        throw err
+      }
 
-      await reply(e, `📦 [2/3] 正在安装依赖...`)
-      await this.installDependencies(targetPath)
+      await reply(e, `📦 [2/3] 正在安装依赖... (最长 ${(TIMEOUT.NPM_INSTALL / 60000).toFixed(0)} 分钟)`)
+      try {
+        await this.installDependencies(targetPath)
+      } catch (err) {
+        if (/超时/.test(err.message)) timeouted = true
+        // 依赖安装失败不阻断（很多插件 package.json 里其实没有必填依赖）
+        Logger.warn(`[nidie] 依赖安装告警: ${err.message}`)
+        await reply(e, `⚠️ 依赖安装出现问题：${err.message}\n插件本体仍已保留，可稍后手动 pnpm install`)
+      }
 
       await reply(e, `📦 [3/3] 正在校验插件结构...`)
       const valid = this.validatePlugin(targetPath)
@@ -246,18 +320,21 @@ export class PluginManager extends PluginBase {
       if (!valid) tips.push('⚠️ 未检测到 apps 目录或 index.js，请确认插件结构是否正确')
 
       this.taskLock = false
+      const timeTip = timeouted ? `\n⚠️ 本次安装过程中出现过超时，已尽可能保留已完成部分\n` : ''
       return reply(
         e,
         `✅ 插件「${dirName}」安装成功！\n` +
         `📁 安装路径：${path.relative(process.cwd(), targetPath)}\n` +
         `${tips.length ? tips.join('\n') + '\n' : ''}` +
+        timeTip +
         `💡 发送 #重载插件 即可生效`
       )
     } catch (err) {
       this.taskLock = false
-      this.removeDir(targetPath)
+      // 超时或其他失败：统一清理目录回滚
+      try { this.removeDir(targetPath) } catch (clErr) { Logger.warn(`[nidie] 清理失败残留目录: ${clErr.message}`) }
       Logger.error(`安装失败: ${err.stack || err}`)
-      return reply(e, `❌ 插件安装失败：${err.message}\n已自动清理残留文件`)
+      return reply(e, `❌ 插件安装失败：${err.message}\n⏪ 已自动中止并清理残留文件`)
     }
   }
 
@@ -318,16 +395,31 @@ export class PluginManager extends PluginBase {
       const isSelf = path.resolve(targetPath) === SELF_DIR
       const label = isSelf ? '插件管理器 (本插件)' : path.basename(targetPath)
 
-      await reply(e, `⏳ 正在更新${isSelf ? '本插件' : `插件「${path.basename(targetPath)}」`}...`)
-      const { stdout } = await execAsync('git pull', { cwd: targetPath })
-      const output = (stdout || '').trim()
+      await reply(e, `⏳ 正在更新${isSelf ? '本插件' : `插件「${path.basename(targetPath)}」`}... (最长 ${(TIMEOUT.GIT_PULL / 60000).toFixed(0)} 分钟)`)
+
+      let output = ''
+      try {
+        const { stdout } = await execWithTimeout(
+          'git pull',
+          { cwd: targetPath, maxBuffer: 10 * 1024 * 1024 },
+          TIMEOUT.GIT_PULL,
+          `拉取更新 ${path.basename(targetPath)}`
+        )
+        output = (stdout || '').trim()
+      } catch (err) {
+        // 拉取超时 → 不继续装依赖，直接结束但不清理目录（不回滚，因为是已有插件）
+        this.taskLock = false
+        return reply(e, `❌ ${label} 更新失败：${err.message}\n⏪ 已中止（原版本未被修改）`)
+      }
 
       let depMsg = ''
       try {
         await this.installDependencies(targetPath)
         depMsg = '\n✅ 依赖已更新'
       } catch (err) {
-        depMsg = `\n⚠️ 依赖安装失败：${err.message}`
+        depMsg = /超时/.test(err.message)
+          ? `\n⚠️ 依赖安装超时（${(TIMEOUT.NPM_INSTALL / 60000).toFixed(0)} 分钟），可手动进入目录执行 pnpm install`
+          : `\n⚠️ 依赖安装失败：${err.message}`
       }
 
       this.taskLock = false
@@ -367,11 +459,17 @@ export class PluginManager extends PluginBase {
     const results = []
     for (const p of updatable) {
       try {
-        const { stdout } = await execAsync('git pull', { cwd: p.path })
+        const { stdout } = await execWithTimeout(
+          'git pull',
+          { cwd: p.path, maxBuffer: 10 * 1024 * 1024 },
+          TIMEOUT.GIT_PULL,
+          `批量更新 ${p.name}`
+        )
         const out = (stdout || '').trim()
         results.push(/already up|up to date|已经是最新|没有内容更新/i.test(out) ? `✅ ${p.name}：已是最新` : `✅ ${p.name}：已更新`)
       } catch (err) {
-        results.push(`❌ ${p.name}：${err.message}`)
+        const suffix = /超时/.test(err.message) ? '（已跳过）' : ''
+        results.push(`❌ ${p.name}：${err.message}${suffix}`)
       }
     }
 
@@ -710,13 +808,22 @@ export class PluginManager extends PluginBase {
   }
 
   async gitClone(repoUrl, targetPath) {
-    return new Promise((resolve, reject) => {
-      const cmd = `git clone --depth=1 "${repoUrl}" "${targetPath}"`
-      exec(cmd, { cwd: PLUGINS_DIR, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) reject(new Error(stderr?.trim() || err.message))
-        else resolve(stdout)
-      })
-    })
+    // 加 --progress 强制输出进度，同时 stderr 合并到 err 信息里
+    const cmd = `git clone --depth=1 --progress "${repoUrl}" "${targetPath}"`
+    try {
+      const { stdout } = await execWithTimeout(
+        cmd,
+        { cwd: PLUGINS_DIR, maxBuffer: 10 * 1024 * 1024 },
+        TIMEOUT.GIT_CLONE,
+        `克隆仓库 ${this.parseRepoName(repoUrl)}`
+      )
+      return stdout
+    } catch (err) {
+      // 超时信息已经由 execWithTimeout 包装好错误文案，直接抛
+      // 普通 git 错误保留 stderr
+      if (/超时/.test(err.message)) throw err
+      throw err
+    }
   }
 
   async installDependencies(targetPath) {
@@ -729,12 +836,14 @@ export class PluginManager extends PluginBase {
       cmd = 'pnpm install --prod'
     } catch (_) {}
 
-    await new Promise(resolve => {
-      exec(cmd, { cwd: targetPath, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) Logger.warn(`依赖安装告警: ${stderr?.trim() || err.message}`)
-        resolve(stdout || '')
-      })
-    })
+    const { stdout, stderr } = await execWithTimeout(
+      cmd,
+      { cwd: targetPath, maxBuffer: 50 * 1024 * 1024 },
+      TIMEOUT.NPM_INSTALL,
+      `安装依赖 ${path.basename(targetPath)}`
+    )
+    if (stderr) Logger.warn(`依赖安装 stderr: ${stderr.trim()}`)
+    return stdout || ''
   }
 
   validatePlugin(targetPath) {
