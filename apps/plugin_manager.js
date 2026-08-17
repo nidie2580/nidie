@@ -502,13 +502,8 @@ export class PluginManager extends PluginBase {
 
       let output = ''
       try {
-        const { stdout } = await execWithTimeout(
-          'git pull --ff-only',
-          { cwd: targetPath, maxBuffer: 10 * 1024 * 1024 },
-          TIMEOUT.GIT_PULL,
-          `拉取更新 ${path.basename(targetPath)}`
-        )
-        output = (stdout || '').trim()
+        const result = await this.safeGitPull(targetPath)
+        output = result.output
       } catch (err) {
         this.taskLock = false
         return reply(e, `❌ ${label} 更新失败：${err.message}\n⏪ 已中止（原版本未被修改）`)
@@ -662,13 +657,7 @@ export class PluginManager extends PluginBase {
       // 3) 有更新 → 执行 pull
       const behindTxt = status.behind > 0 ? `（落后 ${status.behind} 个提交）` : ''
       try {
-        const { stdout } = await execWithTimeout(
-          'git pull --ff-only',
-          { cwd: p.path, maxBuffer: 10 * 1024 * 1024 },
-          TIMEOUT.GIT_PULL,
-          `批量更新 ${p.name}`
-        )
-        const out = (stdout || '').trim()
+        const pullResult = await this.safeGitPull(p.path)
         updated++
         results.push(`🔄 ${p.name}：已更新${behindTxt}`)
       } catch (err) {
@@ -1161,6 +1150,83 @@ export class PluginManager extends PluginBase {
     const cleaned = url.replace(/\.git$/, '').replace(/\/$/, '')
     const parts = cleaned.split(/[:/]/)
     return parts[parts.length - 1]
+  }
+
+  /**
+   * 安全的 git pull：先尝试 --ff-only，失败则自动 stash → pull → pop
+   * 应对本地有修改导致无法快进合并的情况
+   */
+  async safeGitPull(targetPath) {
+    // 1) 尝试 --ff-only（最干净，不产生 merge commit）
+    try {
+      const { stdout } = await execWithTimeout(
+        'git pull --ff-only',
+        { cwd: targetPath, maxBuffer: 10 * 1024 * 1024 },
+        TIMEOUT.GIT_PULL,
+        `拉取更新 ${path.basename(targetPath)}`
+      )
+      return { ok: true, output: (stdout || '').trim() }
+    } catch (ffErr) {
+      // 不是 fast-forward 错误 → 直接抛
+      if (!/Not possible to fast-forward|refusing to merge unrelated histories/i.test(ffErr.message || '')) {
+        throw ffErr
+      }
+      // 是 ff-only 错误 → 走 stash 流程
+      Logger.warn(`[nidie] --ff-only 失败，尝试 stash + pull + pop`)
+    }
+
+    // 2) stash 本地修改
+    let stashed = false
+    try {
+      await execAsync('git stash push -u -m "nidie-auto-stash-before-update"', { cwd: targetPath })
+      stashed = true
+    } catch (_) {
+      // stash 失败（可能没东西可 stash），继续尝试直接 pull
+    }
+
+    // 3) 普通 pull（允许 merge / rebase）
+    let output = ''
+    try {
+      const { stdout } = await execWithTimeout(
+        'git pull',
+        { cwd: targetPath, maxBuffer: 10 * 1024 * 1024 },
+        TIMEOUT.GIT_PULL,
+        `拉取更新 ${path.basename(targetPath)}`
+      )
+      output = (stdout || '').trim()
+    } catch (err) {
+      // pull 也失败 → 尝试 rebase 方式
+      try {
+        const { stdout } = await execWithTimeout(
+          'git pull --rebase',
+          { cwd: targetPath, maxBuffer: 10 * 1024 * 1024 },
+          TIMEOUT.GIT_PULL,
+          `rebase 拉取 ${path.basename(targetPath)}`
+        )
+        output = (stdout || '').trim()
+      } catch (rebaseErr) {
+        // 全部失败 → 恢复 stash
+        if (stashed) {
+          try { await execAsync('git stash pop', { cwd: targetPath }) } catch (_) {}
+        }
+        throw err  // 抛原始 pull 错误
+      }
+    }
+
+    // 4) 恢复 stash
+    if (stashed) {
+      try {
+        const { stdout } = await execAsync('git stash pop', { cwd: targetPath })
+        const stashOut = (stdout || '').trim()
+        if (/conflict/i.test(stashOut)) {
+          Logger.warn(`[nidie] stash pop 有冲突，请手动解决: ${stashOut}`)
+        }
+      } catch (popErr) {
+        Logger.warn(`[nidie] stash pop 失败，已保留 stash: ${popErr.message}`)
+      }
+    }
+
+    return { ok: true, output, stashed: true }
   }
 
   async gitClone(repoUrl, targetPath) {
