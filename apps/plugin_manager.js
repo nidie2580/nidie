@@ -942,7 +942,12 @@ export class PluginManager extends PluginBase {
           Logger.mark(`[nidie] 截图方案 0c: 独立启动 puppeteer chromium`)
           browser = await RawPuppeteer.launch({
             headless: 'new',
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu']
+            args: [
+              '--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu',
+              '--window-size=1000,1600',
+              '--hide-scrollbars'
+            ],
+            defaultViewport: null  // 不做默认 viewport 限制，使用窗口大小
           })
           weStartedBrowser = true
         } else {
@@ -954,23 +959,45 @@ export class PluginManager extends PluginBase {
           const fileUrl = 'file://' + htmlPath.replace(/\\/g, '/')
           Logger.mark(`[nidie] 加载本地 HTML: ${fileUrl.slice(0, 80)}`)
           page = await browser.newPage()
-          await page.setViewport({ width: 800, height: 600, deviceScaleFactor: 2 })
-          await page.goto(fileUrl, { waitUntil: 'domcontentloaded', timeout: 25000 })
-          await new Promise(r => setTimeout(r, 300))  // 等 CSS 渲染
-          const { height } = await page.evaluate(() => ({
-            height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, 300)
-          }))
-          const img = await page.screenshot({
-            type: 'png',
-            fullPage: false,
-            clip: { x: 0, y: 0, width: 800, height }
-          })
-          if (img) {
+          // 安全地设置 viewport：
+          // puppeteer-core@24.42.0 ESM 版本里 EmulationManager 有 bug：
+          // setViewport 时如果之前的内部 state 包含 deviceScaleFactor，
+          // sync() → #applyViewport() 会把 height 丢掉，
+          // 报 Protocol error (Emulation.setDeviceMetricsOverride): height missing
+          // 所以这里：
+          //   1) 只传 width + height，绝对不传 deviceScaleFactor / isMobile 等
+          //   2) 外层 try/catch，失败了就忽略（使用默认视口），不阻断截图
+          try {
+            await page.setViewport({ width: 900, height: 1200 })
+            Logger.mark(`[nidie] setViewport 成功 (900x1200)`)
+          } catch (vpErr) {
+            Logger.warn(`[nidie] setViewport 失败（忽略，继续用默认视口）: ${vpErr.message}`)
+          }
+          await page.goto(fileUrl, { waitUntil: 'load', timeout: 30000 })
+          await new Promise(r => setTimeout(r, 500))
+          // fullPage 截图：整页截取，无需手动算 height/clip
+          const img = await page.screenshot({ type: 'png', fullPage: true, captureBeyondViewport: true })
+          if (img && (Buffer.isBuffer(img) ? img.length : typeof img === 'string' ? img.length : 0) > 1000) {
             const len = Buffer.isBuffer(img) ? img.length : (typeof img === 'string' ? img.length : 0)
-            Logger.mark(`[nidie] 方案 0 截图成功 (${len} 字节)`)
+            Logger.mark(`[nidie] 方案 0(fullPage) 截图成功 (${len} 字节)`)
             return reply(e, img)
           } else {
-            Logger.warn(`[nidie] 方案 0 screenshot 返回空值: ${typeof img}`)
+            // fullPage 返回太小（<1KB）时再退一步，用简单 clip 截图
+            Logger.warn(`[nidie] 方案 0 fullPage 结果过小，退一步 clip 截图`)
+            const { width, height } = await page.evaluate(() => ({
+              width: Math.max(document.body.scrollWidth, document.documentElement.scrollWidth, 800),
+              height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, 300)
+            }))
+            const img2 = await page.screenshot({
+              type: 'png', captureBeyondViewport: true,
+              clip: { x: 0, y: 0, width, height }
+            })
+            if (img2) {
+              const len2 = Buffer.isBuffer(img2) ? img2.length : (typeof img2 === 'string' ? img2.length : 0)
+              Logger.mark(`[nidie] 方案 0(clip fallback) 截图成功 (${len2} 字节)`)
+              return reply(e, img2)
+            }
+            Logger.warn(`[nidie] 方案 0 两次 screenshot 都返回空`)
           }
         }
       } catch (err) {
