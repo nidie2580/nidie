@@ -954,7 +954,7 @@ export class PluginManager extends PluginBase {
           const fileUrl = 'file://' + htmlPath.replace(/\\/g, '/')
           Logger.mark(`[nidie] 加载本地 HTML: ${fileUrl.slice(0, 80)}`)
           page = await browser.newPage()
-          await page.setViewport({ width: 800, deviceScaleFactor: 2 })
+          await page.setViewport({ width: 800, height: 600, deviceScaleFactor: 2 })
           await page.goto(fileUrl, { waitUntil: 'domcontentloaded', timeout: 25000 })
           await new Promise(r => setTimeout(r, 300))  // 等 CSS 渲染
           const { height } = await page.evaluate(() => ({
