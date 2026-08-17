@@ -890,22 +890,25 @@ export class PluginManager extends PluginBase {
   }
 
   async showHelp(e) {
-    return reply(
-      e,
-      `📦 插件管理器 - 使用帮助\n\n` +
-      `#安装 <名称|仓库地址>\n   安装一个插件，支持预设名或 git 地址\n` +
-      `#删除 <名称>\n   删除指定插件\n` +
-      `#更新插件 <名称>\n   更新指定插件\n` +
-      `#更新全部插件\n   更新所有 git 插件\n` +
-      `#插件列表\n   查看已安装的插件（图片）\n` +
-      `#插件市场\n   查看可一键安装的插件（图片）\n` +
-      `#插件详情 <名称>\n   查看插件详细信息\n` +
-      `#重载插件\n   尝试热重载（仅刷新已存在插件的代码，新装插件无效）\n` +
-      `#重启\n   重启机器人进程（推荐，新装插件后必用）\n` +
-      `#插件管理帮助\n   查看本帮助\n\n` +
-      `⚠️ 安装/删除/更新/重载/重启 操作仅主人可用\n` +
-      `💡 仓库：https://github.com/nidie2580/nidie`
-    )
+    // 走图片渲染（和 #插件列表/#插件市场 同一渲染管线）
+    return this.renderListImage(e, {
+      title: '插件管理器 - 使用帮助',
+      subtitle: '指令列表',
+      columns: ['指令', '说明', '权限'],
+      rows: [
+        ['#安装 <名称|仓库地址>', '安装一个插件，支持预设名或 git 地址', '主人'],
+        ['#删除 <名称>', '删除指定插件', '主人'],
+        ['#更新插件 <名称>', '更新指定插件（支持更新本插件自身）', '主人'],
+        ['#更新全部插件', '更新所有 git 插件', '主人'],
+        ['#插件列表', '查看已安装的插件（图片）', '全员'],
+        ['#插件市场', '查看可一键安装的插件（图片）', '全员'],
+        ['#插件详情 <名称>', '查看插件详细信息', '全员'],
+        ['#重载插件', '尝试热重载（仅刷新已存在插件代码，新装无效）', '主人'],
+        ['#重启', '重启机器人进程（推荐，新装插件后必用）', '主人'],
+        ['#插件管理帮助', '查看本帮助（图片）', '全员']
+      ],
+      footer: '⚠️ 安装/删除/更新/重载/重启 操作仅主人可用\n💡 仓库：https://github.com/nidie2580/nidie'
+    })
   }
 
   // ===== 图片渲染 =====
@@ -1073,8 +1076,17 @@ export class PluginManager extends PluginBase {
 
   buildListHtml({ title, subtitle, columns, rows, footer }) {
     const headerCells = columns.map(c => `<th>${esc(c)}</th>`).join('')
-    const bodyRows = rows.map(r => {
-      const cells = r.map(c => `<td>${esc(c)}</td>`).join('')
+    const bodyRows = rows.map((r, rowIdx) => {
+      const cells = r.map((c, colIdx) => {
+        // 权限列（最后一列，名为"权限"）做颜色渲染
+        if (columns[colIdx] === '权限') {
+          const isMaster = /主人/.test(String(c))
+          const color = isMaster ? '#d97706' : '#10b981'
+          const bg = isMaster ? '#fef3c7' : '#d1fae5'
+          return `<td><span style="display:inline-block;padding:3px 10px;border-radius:10px;background:${bg};color:${color};font-size:12px;font-weight:600;">${esc(c)}</span></td>`
+        }
+        return `<td>${esc(c)}</td>`
+      }).join('')
       return `<tr>${cells}</tr>`
     }).join('')
 
@@ -1131,9 +1143,15 @@ export class PluginManager extends PluginBase {
     letter-spacing: 0.5px;
   }
   tr:last-child td { border-bottom: none; }
-  td:nth-child(1) { color: #888; width: 40px; }
-  td:nth-child(2) { font-weight: 600; color: #333; }
-  td:nth-child(4) { color: #666; font-size: 13px; }
+  td { color: #333; }
+  /* 列表页（4 列：序号 名称 仓库 状态）的列宽设置 */
+  table.cols-4 td:nth-child(1) { color: #888; width: 40px; }
+  table.cols-4 td:nth-child(2) { font-weight: 600; color: #333; }
+  table.cols-4 td:nth-child(4) { color: #666; font-size: 13px; }
+  /* 帮助页（3 列：指令 说明 权限）的列宽设置 */
+  table.cols-3 td:nth-child(1) { font-weight: 600; color: #333; white-space: nowrap; width: 35%; }
+  table.cols-3 td:nth-child(2) { color: #555; font-size: 13px; }
+  table.cols-3 td:nth-child(3) { width: 70px; text-align: center; }
   .footer {
     padding: 16px 28px 24px;
     font-size: 13px;
@@ -1149,7 +1167,7 @@ export class PluginManager extends PluginBase {
       <div class="subtitle">${esc(subtitle)}</div>
     </div>
     <div class="table-wrap">
-      <table>
+      <table class="cols-${columns.length}">
         <thead>
           <tr>${headerCells}</tr>
         </thead>
