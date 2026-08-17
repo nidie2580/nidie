@@ -344,7 +344,8 @@ export class PluginManager extends PluginBase {
         { reg: '^#?插件列表$', fnc: 'listPlugins' },
         { reg: '^#?插件详情', fnc: 'pluginDetail' },
         { reg: '^#?插件市场$', fnc: 'listPresetPlugins' },
-        { reg: '^#?重载插件$', fnc: 'reloadPlugins' }
+        { reg: '^#?重载插件$', fnc: 'reloadPlugins' },
+        { reg: '^#?重启(插件)?$', fnc: 'restartBot' }
       ]
     })
     this.taskLock = false
@@ -411,7 +412,7 @@ export class PluginManager extends PluginBase {
         `📁 安装路径：${path.relative(process.cwd(), targetPath)}\n` +
         `${tips.length ? tips.join('\n') + '\n' : ''}` +
         timeTip +
-        `💡 发送 #重载插件 即可生效`
+        `💡 发送 #重启 让机器人重启后即可生效`
       )
     } catch (err) {
       this.taskLock = false
@@ -442,7 +443,7 @@ export class PluginManager extends PluginBase {
         e,
         `✅ 插件「${path.basename(targetPath)}」已删除\n` +
         `📁 已删除：${path.relative(process.cwd(), targetPath)}\n` +
-        `💡 发送 #重载插件 即可生效`
+        `💡 发送 #重启 让机器人重启后即可生效`
       )
     } catch (err) {
       Logger.error(`删除失败: ${err.stack || err}`)
@@ -525,7 +526,7 @@ export class PluginManager extends PluginBase {
       }
 
       this.taskLock = false
-      return reply(e, `✅ ${label} 更新成功\n${output}${depMsg}\n💡 发送 #重载插件 即可生效`)
+      return reply(e, `✅ ${label} 更新成功\n${output}${depMsg}\n💡 发送 #重启 让机器人重启后即可生效`)
     } catch (err) {
       this.taskLock = false
       Logger.error(`更新失败: ${err.stack || err}`)
@@ -685,7 +686,7 @@ export class PluginManager extends PluginBase {
       `   🔄 已更新：${updated}\n` +
       `   ❌ 失败：${failed}\n\n` +
       results.join('\n') +
-      `\n\n💡 发送 #重载插件 即可生效`
+      `\n\n💡 发送 #重启 让机器人重启后即可生效`
     )
   }
 
@@ -779,22 +780,124 @@ export class PluginManager extends PluginBase {
     })
   }
 
+  /**
+   * 重载插件 — 尽力尝试，但坦诚告知限制
+   * 大多数 Yunzai 版本的 loadPlugins() 只能刷新已存在插件的代码，
+   * 不能扫描到新装的 plugins/xxx/ 目录。新装插件必须重启。
+   */
   async reloadPlugins(e) {
     if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #重载插件')
-    try {
-      if (typeof globalThis.runtime === 'object' && globalThis.runtime.loadPlugins) {
-        await globalThis.runtime.loadPlugins()
-        return reply(e, '✅ 插件已重新加载')
+    await reply(e, '⏳ 正在尝试重载插件...')
+
+    const tried = []
+    let loaded = false
+
+    // 1) PluginsLoader.loadPlugins (TRSS / Miao)
+    const PluginsLoader =
+      globalThis.PluginsLoader ||
+      globalThis.pluginsLoader ||
+      globalThis.Bot?.pluginsLoader ||
+      globalThis.runtime?.PluginsLoader
+    if (PluginsLoader?.loadPlugins) {
+      tried.push('PluginsLoader.loadPlugins')
+      try {
+        await PluginsLoader.loadPlugins()
+        loaded = true
+        Logger.mark(`[nidie] PluginsLoader.loadPlugins() 调用成功`)
+      } catch (err) {
+        Logger.warn(`[nidie] PluginsLoader.loadPlugins 失败: ${err.message}`)
       }
-      if (typeof globalThis.Bot === 'object' && globalThis.Bot.reloadPlugins) {
-        await globalThis.Bot.reloadPlugins()
-        return reply(e, '✅ 插件已重新加载')
-      }
-      return reply(e, '✅ 已尝试重载插件\n若未生效请手动重启 Yunzai')
-    } catch (err) {
-      Logger.error(`重载失败: ${err.stack || err}`)
-      return reply(e, `❌ 重载失败：${err.message}`)
     }
+
+    // 2) Bot.reloadPlugins
+    if (!loaded && globalThis.Bot?.reloadPlugins) {
+      tried.push('Bot.reloadPlugins')
+      try {
+        await globalThis.Bot.reloadPlugins()
+        loaded = true
+        Logger.mark(`[nidie] Bot.reloadPlugins() 调用成功`)
+      } catch (err) {
+        Logger.warn(`[nidie] Bot.reloadPlugins 失败: ${err.message}`)
+      }
+    }
+
+    // 3) runtime.loadPlugins
+    if (!loaded && globalThis.runtime?.loadPlugins) {
+      tried.push('runtime.loadPlugins')
+      try {
+        await globalThis.runtime.loadPlugins()
+        loaded = true
+        Logger.mark(`[nidie] runtime.loadPlugins() 调用成功`)
+      } catch (err) {
+        Logger.warn(`[nidie] runtime.loadPlugins 失败: ${err.message}`)
+      }
+    }
+
+    if (loaded) {
+      return reply(e,
+        `✅ 已调用重载接口 (${tried[0]})\n\n` +
+        `⚠️ 注意：重载只能刷新【已存在插件】的代码修改，\n` +
+        `   【新安装】的插件目录不会被扫描到，必须重启机器人才能生效。\n\n` +
+        `💡 如果是装了新插件后用这条命令发现没生效，请改发 #重启`
+      )
+    }
+    return reply(e,
+      `⚠️ 当前 Yunzai 版本没有可用的热重载接口\n` +
+      `已尝试: ${tried.length ? tried.join(' / ') : '无'}\n\n` +
+      `💡 请直接发送 #重启 让机器人重启加载全部插件`
+    )
+  }
+
+  /**
+   * #重启 — 调用 Yunzai restart 机制或退回 process.exit
+   * 进程管理器 (pm2 / systemd / npm) 会自动拉起
+   */
+  async restartBot(e) {
+    if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #重启')
+
+    // 1) Yunzai 自带的 restart 插件机制
+    //    一些分支挂载在 Bot.restart / globalThis.restart / process restart 事件
+    const candidates = [
+      { name: 'Bot.restart', fn: () => globalThis.Bot?.restart?.() },
+      { name: 'globalThis.restart', fn: () => globalThis.restart?.() },
+      { name: 'runtime.restart', fn: () => globalThis.runtime?.restart?.() },
+      { name: 'Bot.emit(restart)', fn: () => globalThis.Bot?.emit?.('restart', { time: 0 }) },
+      // exec child_process 重启
+      { name: 'process exec', fn: () => {
+        // 触发 Yunzai 自带的 restart 监听
+        try { process.emit('restart', { time: 0 }) } catch (_) {}
+      } }
+    ]
+
+    for (const c of candidates) {
+      try {
+        if (typeof c.fn === 'function') {
+          const r = c.fn()
+          if (r !== false) {
+            await reply(e, `🔄 正在重启 (${c.name})...\n稍后约 10-30 秒后机器人会重新上线`)
+            Logger.mark(`[nidie] 触发重启: ${c.name}`)
+            // 给消息一点时间发出去
+            setTimeout(() => {
+              try { process.exit(0) } catch (_) {}
+            }, 1500)
+            return true
+          }
+        }
+      } catch (err) {
+        Logger.warn(`[nidie] ${c.name} 失败: ${err.message}`)
+      }
+    }
+
+    // 2) 兜底：直接 process.exit(0)，依赖进程管理器拉起
+    await reply(e,
+      `🔄 即将强制重启进程\n` +
+      `⚠️ 如果机器人没有自动重新上线，说明没有用 pm2/systemd 等进程管理器，请手动启动`
+    )
+    Logger.mark(`[nidie] 1.5 秒后 process.exit(0) 强制重启`)
+    setTimeout(() => {
+      try { process.exit(0) } catch (_) {}
+    }, 1500)
+    return true
   }
 
   async showHelp(e) {
@@ -808,9 +911,10 @@ export class PluginManager extends PluginBase {
       `#插件列表\n   查看已安装的插件（图片）\n` +
       `#插件市场\n   查看可一键安装的插件（图片）\n` +
       `#插件详情 <名称>\n   查看插件详细信息\n` +
-      `#重载插件\n   重新加载所有插件\n` +
+      `#重载插件\n   尝试热重载（仅刷新已存在插件的代码，新装插件无效）\n` +
+      `#重启\n   重启机器人进程（推荐，新装插件后必用）\n` +
       `#插件管理帮助\n   查看本帮助\n\n` +
-      `⚠️ 安装/删除/更新/重载 操作仅主人可用\n` +
+      `⚠️ 安装/删除/更新/重载/重启 操作仅主人可用\n` +
       `💡 仓库：https://github.com/nidie2580/nidie`
     )
   }
