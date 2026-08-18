@@ -228,6 +228,7 @@ const TIMEOUT = {
 
 const PLUGINS_DIR = path.resolve(process.cwd(), 'plugins')
 const SELF_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const ROLLBACK_STATE_FILE = path.join(SELF_DIR, '.rollback_state.json')
 
 /**
  * 带超时 & 进程树清理的 exec 封装
@@ -379,6 +380,87 @@ async function cleanupGitState(targetPath) {
   return cleaned
 }
 
+// ===== 回滚快照 =====
+/**
+ * 读回滚快照（所有插件）
+ * @returns {Record<string, {beforeCommit:string, branch:string, remote:string, updatedAt:number, targetPath:string, label:string}>}
+ */
+function readAllRollbackSnapshots() {
+  try {
+    if (fs.existsSync(ROLLBACK_STATE_FILE)) {
+      const raw = fs.readFileSync(ROLLBACK_STATE_FILE, 'utf-8')
+      const obj = JSON.parse(raw || '{}')
+      return obj && typeof obj === 'object' ? obj : {}
+    }
+  } catch (e) {
+    Logger.warn(`[nidie] 读取回滚快照失败（忽略，当空处理）: ${e.message}`)
+  }
+  return {}
+}
+
+/** 写回滚快照（整体覆盖写入，保证文件完整） */
+function writeAllRollbackSnapshots(snapshots) {
+  try {
+    const tmp = ROLLBACK_STATE_FILE + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(snapshots || {}, null, 2), 'utf-8')
+    fs.renameSync(tmp, ROLLBACK_STATE_FILE)
+  } catch (e) {
+    Logger.error(`[nidie] 写入回滚快照失败: ${e.message}`)
+  }
+}
+
+/**
+ * 读取某插件的回滚快照
+ * @param {string} pluginKey 插件路径（绝对路径，作为 key）
+ */
+function getRollbackSnapshot(pluginKey) {
+  return readAllRollbackSnapshots()[pluginKey] || null
+}
+
+/**
+ * 更新插件前记录「更新前的 HEAD commit」作为回滚锚点
+ * @param {string} targetPath 插件目录（绝对路径）
+ * @param {string} label 人类可读标签（如 miao-plugin / 插件管理器）
+ */
+async function saveRollbackSnapshot(targetPath, label) {
+  let beforeCommit = ''
+  let branch = ''
+  let remote = ''
+  try {
+    const { stdout: cOut } = await execAsync('git rev-parse HEAD', { cwd: targetPath })
+    beforeCommit = (cOut || '').trim()
+  } catch (_) {}
+  try {
+    const { stdout: bOut } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: targetPath })
+    branch = (bOut || '').trim()
+  } catch (_) {}
+  try {
+    const { stdout: rOut } = await execAsync('git remote get-url origin', { cwd: targetPath })
+    remote = (rOut || '').trim()
+  } catch (_) {}
+
+  const snapshots = readAllRollbackSnapshots()
+  snapshots[targetPath] = {
+    beforeCommit,
+    branch,
+    remote,
+    updatedAt: Date.now(),
+    targetPath,
+    label
+  }
+  writeAllRollbackSnapshots(snapshots)
+  Logger.mark(`[nidie] 已记录 ${label} 更新前快照: commit=${beforeCommit.slice(0, 8)}`)
+}
+
+/** 移除某插件的回滚快照（用于删除插件时） */
+function removeRollbackSnapshot(pluginKey) {
+  const snapshots = readAllRollbackSnapshots()
+  if (snapshots[pluginKey]) {
+    delete snapshots[pluginKey]
+    writeAllRollbackSnapshots(snapshots)
+  }
+}
+
 const PRESET_PLUGINS = {
   'ws-plugin': 'https://gitee.com/xiaoye12123/ws-plugin.git',
   'guoba-plugin': 'https://gitee.com/guoba-yunzai/guoba-plugin.git',
@@ -445,6 +527,7 @@ export class PluginManager extends PluginBase {
         { reg: '^#?删除', fnc: 'uninstallPlugin' },
         { reg: '^#?更新插件', fnc: 'updatePlugin' },
         { reg: '^#?更新全部插件$', fnc: 'updateAllPlugins' },
+        { reg: '^#?回滚插件', fnc: 'rollbackPlugin' },
         { reg: '^#?插件列表$', fnc: 'listPlugins' },
         { reg: '^#?插件详情', fnc: 'pluginDetail' },
         { reg: '^#?插件市场$', fnc: 'listPresetPlugins' },
@@ -543,6 +626,7 @@ export class PluginManager extends PluginBase {
 
     try {
       this.removeDir(targetPath)
+      try { removeRollbackSnapshot(path.resolve(targetPath)) } catch (_) {}
       return reply(
         e,
         `✅ 插件「${path.basename(targetPath)}」已删除\n` +
@@ -604,8 +688,13 @@ export class PluginManager extends PluginBase {
         return reply(e, `✅ ${label} 已是最新版本，无需更新\n分支：${status.branch}  提交：${(status.local || '').slice(0, 8)}${fixTip}`)
       }
 
-      // 3) 有更新 → 告知落后多少个提交，再执行 pull
+      // 3) 有更新 → 保存当前 HEAD 为回滚快照，然后 pull
       const behindTxt = status.behind > 0 ? `（落后 ${status.behind} 个提交）` : ''
+      try {
+        await saveRollbackSnapshot(targetPath, label)
+      } catch (snapErr) {
+        Logger.warn(`[nidie] 保存回滚快照失败（不阻断更新）: ${snapErr.message}`)
+      }
       await reply(e, `⏳ 发现可用更新${behindTxt}，正在拉取... (最长 ${(TIMEOUT.GIT_PULL / 60000).toFixed(0)} 分钟)`)
 
       let output = ''
@@ -629,7 +718,8 @@ export class PluginManager extends PluginBase {
       }
 
       this.taskLock = false
-      return reply(e, `✅ ${label} 更新成功\n${output}${depMsg}\n💡 发送 #重启 让机器人重启后即可生效`)
+      const rollbackCmd = isSelf ? '#回滚插件 nidie' : `#回滚插件 ${path.basename(targetPath)}`
+      return reply(e, `✅ ${label} 更新成功\n${output}${depMsg}\n💡 发送 #重启 让机器人重启后即可生效\n⚠️ 更新后若发现问题，发送 ${rollbackCmd} 可一键回滚到更新前的版本`)
     } catch (err) {
       this.taskLock = false
       Logger.error(`更新失败: ${err.stack || err}`)
@@ -816,8 +906,13 @@ export class PluginManager extends PluginBase {
         continue
       }
 
-      // 3) 有更新 → 执行 pull
+      // 3) 有更新 → 先存回滚快照，再执行 pull
       const behindTxt = status.behind > 0 ? `（落后 ${status.behind} 个提交）` : ''
+      try {
+        await saveRollbackSnapshot(p.path, p.name)
+      } catch (snapErr) {
+        Logger.warn(`[nidie] 批量更新：保存 ${p.name} 回滚快照失败（不阻断更新）: ${snapErr.message}`)
+      }
       try {
         const pullResult = await this.safeGitPull(p.path)
         updated++
@@ -839,6 +934,143 @@ export class PluginManager extends PluginBase {
       results.join('\n') +
       `\n\n💡 发送 #重启 让机器人重启后即可生效`
     )
+  }
+
+  /**
+   * 回滚插件到「上次更新前」的版本
+   * 指令：#回滚插件 <名称>
+   */
+  async rollbackPlugin(e) {
+    if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #回滚插件')
+    if (this.taskLock) return reply(e, '⚠️ 当前已有任务在执行中，请稍后再试...')
+
+    const text = String(e?.msg ?? e?.raw_message ?? '')
+    const name = text.replace(/^#?回滚插件\s*/, '').trim()
+    if (!name) {
+      // 不带参数 → 列出所有可回滚的插件
+      const all = readAllRollbackSnapshots()
+      const keys = Object.keys(all)
+      if (keys.length === 0) {
+        return reply(e, '📦 当前没有可回滚的插件\n（从未执行过 #更新插件 / #更新全部插件，就没有回滚快照）')
+      }
+      const lines = keys.map((k, i) => {
+        const s = all[k]
+        const d = s.updatedAt ? new Date(s.updatedAt) : null
+        const timeStr = d ? `${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : '-'
+        return `#${i + 1} ${s.label || path.basename(k)}\n   快照时间：${timeStr}\n   回滚目标：${(s.beforeCommit || '').slice(0, 8) || '-'}\n   分支：${s.branch || '-'}`
+      })
+      return reply(e, `📦 可回滚的插件（共 ${keys.length} 个）\n\n${lines.join('\n\n')}\n\n发送 #回滚插件 <名称> 即可执行回滚`)
+    }
+
+    // 识别本插件
+    const selfNames = ['nidie', 'plugin-manager', path.basename(SELF_DIR)]
+    const isSelf = selfNames.includes(name) || this.isSelfRepoUrl(name)
+
+    let targetPath
+    if (isSelf) {
+      targetPath = SELF_DIR
+    } else {
+      targetPath = this.findPluginPath(name)
+      if (!targetPath) return reply(e, `❌ 未找到插件「${name}」\n可发送 #插件列表 查看已安装插件`)
+    }
+    const resolvedPath = path.resolve(targetPath)
+    const label = resolvedPath === SELF_DIR ? '插件管理器 (本插件)' : path.basename(targetPath)
+
+    // 1) 读取快照
+    const snap = getRollbackSnapshot(resolvedPath)
+    if (!snap || !snap.beforeCommit) {
+      return reply(e, `❌ 插件「${label}」没有回滚快照\n（只有执行过 #更新插件 / #更新全部插件 的插件才有快照）`)
+    }
+
+    // 2) 显示快照信息 + 二次确认（这里通过后续步骤直接执行，若需要确认可以改为 prompt）
+    //    为了简化：直接执行，但把快照信息先发给用户
+    let currentCommit = ''
+    try {
+      const { stdout: cOut } = await execAsync('git rev-parse HEAD', { cwd: targetPath })
+      currentCommit = (cOut || '').trim()
+    } catch (_) {}
+
+    // 当前 HEAD == 快照 → 说明已经回滚过了，或者更新后代码没动
+    if (currentCommit && snap.beforeCommit && currentCommit === snap.beforeCommit) {
+      return reply(e,
+        `⏭️ 「${label}」当前已是快照版本，无需回滚\n` +
+        `当前提交：${currentCommit.slice(0, 8)}\n` +
+        `快照时间：${snap.updatedAt ? new Date(snap.updatedAt).toLocaleString() : '-'}`
+      )
+    }
+
+    if (!fs.existsSync(path.join(targetPath, '.git'))) {
+      return reply(e, `⚠️ 插件「${label}」不是 git 仓库，无法回滚`)
+    }
+
+    this.taskLock = true
+    try {
+      const snapTime = snap.updatedAt ? new Date(snap.updatedAt).toLocaleString() : '-'
+      await reply(e,
+        `⏪ 开始回滚「${label}」\n` +
+        `   快照时间：${snapTime}\n` +
+        `   当前 HEAD：${(currentCommit || '').slice(0, 8) || '-'}\n` +
+        `   回滚到：${snap.beforeCommit.slice(0, 8)}\n` +
+        `   分支：${snap.branch || '-'}\n` +
+        `⏱️ 最长 ${(TIMEOUT.GIT_PULL / 60000).toFixed(0)} 分钟`
+      )
+
+      // 3) 先清理 git 中间状态（merge/rebase 残留会导致 reset 失败）
+      try { await cleanupGitState(targetPath) } catch (_) {}
+
+      // 4) git reset --hard <beforeCommit>
+      let resetOutput = ''
+      try {
+        const { stdout, stderr } = await execWithTimeout(
+          `git reset --hard "${snap.beforeCommit}"`,
+          { cwd: targetPath, maxBuffer: 10 * 1024 * 1024 },
+          TIMEOUT.GIT_PULL,
+          `回滚 ${label}`
+        )
+        resetOutput = ((stdout || '') + '\n' + (stderr || '')).trim()
+        Logger.mark(`[nidie] ${label} 回滚完成: ${resetOutput}`)
+      } catch (resetErr) {
+        // reset 失败：尝试 git checkout <commit> --detach 兜底
+        Logger.warn(`[nidie] git reset --hard 失败，尝试 git checkout: ${resetErr.message}`)
+        try {
+          const { stdout, stderr } = await execWithTimeout(
+            `git checkout "${snap.beforeCommit}"`,
+            { cwd: targetPath, maxBuffer: 10 * 1024 * 1024 },
+            TIMEOUT.GIT_PULL,
+            `回滚 ${label}(checkout)`
+          )
+          resetOutput = `（reset 失败，使用 checkout）\n${(stdout || '') + '\n' + (stderr || '')}`.trim()
+        } catch (coErr) {
+          this.taskLock = false
+          return reply(e, `❌ ${label} 回滚失败：reset 失败（${resetErr.message}），checkout 也失败（${coErr.message}）`)
+        }
+      }
+
+      // 5) 装依赖（版本回退了，依赖版本可能也要对应回退）
+      let depMsg = ''
+      try {
+        await this.installDependencies(targetPath)
+        depMsg = '\n✅ 依赖已按回滚后的版本重新安装'
+      } catch (err) {
+        depMsg = /超时/.test(err.message)
+          ? `\n⚠️ 依赖安装超时（${(TIMEOUT.NPM_INSTALL / 60000).toFixed(0)} 分钟），可手动进入目录执行 pnpm install`
+          : `\n⚠️ 依赖安装失败：${err.message}\n   建议手动 cd ${path.relative(process.cwd(), targetPath)} && pnpm install`
+      }
+
+      this.taskLock = false
+      return reply(e,
+        `✅ ${label} 已回滚到上次更新前的版本\n` +
+        (resetOutput ? `${resetOutput.slice(0, 500)}\n` : '') +
+        `快照时间：${snapTime}\n` +
+        `回滚目标 commit：${snap.beforeCommit.slice(0, 8)}${depMsg}\n` +
+        `💡 回滚快照会保留，可再次 #回滚插件 ${isSelf ? 'nidie' : path.basename(targetPath)} 原地停留\n` +
+        `💡 发送 #重启 让机器人重启后生效`
+      )
+    } catch (err) {
+      this.taskLock = false
+      Logger.error(`回滚失败: ${err.stack || err}`)
+      return reply(e, `❌ ${label} 回滚失败：${err.message}`)
+    }
   }
 
   async listPlugins(e) {
@@ -1060,8 +1292,9 @@ export class PluginManager extends PluginBase {
       rows: [
         ['#安装 <名称|仓库地址>', '安装一个插件，支持预设名或 git 地址', '主人'],
         ['#删除 <名称>', '删除指定插件', '主人'],
-        ['#更新插件 <名称>', '更新指定插件（支持更新本插件自身）', '主人'],
-        ['#更新全部插件', '更新所有 git 插件', '主人'],
+        ['#更新插件 <名称>', '更新指定插件（支持更新本插件自身），自动保存回滚快照', '主人'],
+        ['#更新全部插件', '更新所有 git 插件，均自动保存回滚快照', '主人'],
+        ['#回滚插件 [名称]', '回滚到上次更新前的版本；不带参数则列出所有可回滚快照', '主人'],
         ['#插件列表', '查看已安装的插件（图片）', '全员'],
         ['#插件市场', '查看可一键安装的插件（图片）', '全员'],
         ['#插件详情 <名称>', '查看插件详细信息', '全员'],
@@ -1069,7 +1302,7 @@ export class PluginManager extends PluginBase {
         ['#重启', '重启机器人进程（推荐，新装插件后必用）', '主人'],
         ['#插件管理帮助', '查看本帮助（图片）', '全员']
       ],
-      footer: '⚠️ 安装/删除/更新/重载/重启 操作仅主人可用\n💡 仓库：https://github.com/nidie2580/nidie'
+      footer: '⚠️ 安装/删除/更新/回滚/重载/重启 操作仅主人可用\n🔄 更新后若出问题，发 #回滚插件 <名称> 即可撤回\n💡 仓库：https://github.com/nidie2580/nidie'
     })
   }
 
