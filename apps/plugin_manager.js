@@ -266,6 +266,12 @@ function execWithTimeout(cmd, opts, timeoutMs, stepName) {
           } catch (_) {
             try { if (pid) child.kill('SIGKILL') } catch (__) {}
           }
+          // 杀进程后清理可能残留的 git 锁（fetch/pull/merge 中断会留下 .git/*.lock）
+          // 这是「差劲更新卡住 → 切换更新显示已是最新但代码是旧的」问题的根因之一
+          try {
+            const cwd = opts?.cwd
+            if (cwd) cleanupGitLocks(cwd, `${stepName} 超时清理`)
+          } catch (_) {}
         }, 1500).unref?.()
       } catch (_) {}
       reject(new Error(`${stepName} 超时 (${(timeoutMs / 1000 / 60).toFixed(1)} 分钟未完成)`))
@@ -273,6 +279,104 @@ function execWithTimeout(cmd, opts, timeoutMs, stepName) {
     // 如果 Promise 被外层 unref，timeout 也不阻塞进程
     timeoutRef.unref?.()
   })
+}
+
+/**
+ * 清理 git 中间状态残留的锁文件
+ * 用于：execWithTimeout 超时杀进程后 / 主动清理 / updatePlugin 开始前
+ * 注意：只删 *.lock 文件，不动 MERGE_HEAD / rebase-merge 等业务状态
+ *       （业务状态由 cleanupGitState 处理，那里会先尝试 git merge --abort）
+ */
+function cleanupGitLocks(targetPath, reason = '') {
+  const gitDir = path.join(targetPath, '.git')
+  if (!fs.existsSync(gitDir)) return
+  // 常见的锁文件（都叫 *.lock）
+  const lockFiles = [
+    'index.lock',           // index 操作锁（最常见，fetch/pull 中断后会残留）
+    'FETCH_HEAD.lock',      // fetch 锁
+    'HEAD.lock',            // HEAD 锁
+    'ORIG_HEAD.lock',
+    'packed-refs.lock',     // refs 更新锁
+    'config.lock',          // config 锁
+    'shallow.lock',         // 浅克隆锁
+    'refs/heads',           // 不会是文件，跳过
+    'objects/pack/.tmp-'    // pack 临时文件前缀（下面单独处理）
+  ].filter(f => !f.endsWith('/'))
+  for (const f of lockFiles) {
+    const p = path.join(gitDir, f)
+    if (fs.existsSync(p)) {
+      try { fs.unlinkSync(p); Logger.warn(`[nidie] ${reason} 删除锁文件: ${f}`) } catch (_) {}
+    }
+  }
+  // 删除 objects/pack 下的 .tmp-* 临时文件（pack 拉一半中断会留下）
+  try {
+    const packDir = path.join(gitDir, 'objects', 'pack')
+    if (fs.existsSync(packDir)) {
+      for (const f of fs.readdirSync(packDir)) {
+        if (/^\.tmp-/.test(f)) {
+          try { fs.unlinkSync(path.join(packDir, f)); Logger.warn(`[nidie] ${reason} 删除 pack 临时文件: ${f}`) } catch (_) {}
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+/**
+ * 清理 git 中间状态（merge/rebase/cherry-pick 进行中）
+ * 优先用 git 原生命令安全 abort，失败再删状态文件
+ * 返回：是否清理过任何东西（用于日志判断）
+ */
+async function cleanupGitState(targetPath) {
+  const gitDir = path.join(targetPath, '.git')
+  if (!fs.existsSync(gitDir)) return false
+  let cleaned = false
+
+  // 1) 先删锁文件（解锁后续 git 命令）
+  cleanupGitLocks(targetPath, 'cleanupGitState')
+
+  // 2) merge 进行中 → git merge --abort
+  if (fs.existsSync(path.join(gitDir, 'MERGE_HEAD'))) {
+    try {
+      await execAsync('git merge --abort', { cwd: targetPath })
+      Logger.warn(`[nidie] cleanupGitState: merge --abort 完成 (${path.basename(targetPath)})`)
+      cleaned = true
+    } catch (e) {
+      Logger.warn(`[nidie] cleanupGitState: git merge --abort 失败，删除 MERGE_HEAD: ${e.message}`)
+      try { fs.unlinkSync(path.join(gitDir, 'MERGE_HEAD')) } catch (_) {}
+      try { fs.unlinkSync(path.join(gitDir, 'MERGE_MSG')) } catch (_) {}
+      try { fs.unlinkSync(path.join(gitDir, 'MERGE_MODE')) } catch (_) {}
+      cleaned = true
+    }
+  }
+
+  // 3) rebase 进行中 → git rebase --abort
+  for (const rbDir of ['rebase-merge', 'rebase-apply']) {
+    if (fs.existsSync(path.join(gitDir, rbDir))) {
+      try {
+        await execAsync('git rebase --abort', { cwd: targetPath })
+        Logger.warn(`[nidie] cleanupGitState: rebase --abort 完成 (${path.basename(targetPath)})`)
+        cleaned = true
+      } catch (e) {
+        Logger.warn(`[nidie] cleanupGitState: git rebase --abort 失败，删除 ${rbDir}: ${e.message}`)
+        try { fs.rmSync(path.join(gitDir, rbDir), { recursive: true, force: true }) } catch (_) {}
+        cleaned = true
+      }
+    }
+  }
+
+  // 4) cherry-pick 进行中 → git cherry-pick --abort
+  if (fs.existsSync(path.join(gitDir, 'CHERRY_PICK_HEAD'))) {
+    try {
+      await execAsync('git cherry-pick --abort', { cwd: targetPath })
+      Logger.warn(`[nidie] cleanupGitState: cherry-pick --abort 完成 (${path.basename(targetPath)})`)
+      cleaned = true
+    } catch (e) {
+      try { fs.unlinkSync(path.join(gitDir, 'CHERRY_PICK_HEAD')) } catch (_) {}
+      cleaned = true
+    }
+  }
+
+  return cleaned
 }
 
 const PRESET_PLUGINS = {
@@ -493,7 +597,11 @@ export class PluginManager extends PluginBase {
       // 2) 已是最新 → 直接跳过，不拉不装
       if (!status.needUpdate) {
         this.taskLock = false
-        return reply(e, `✅ ${label} 已是最新版本，无需更新\n分支：${status.branch}  提交：${(status.local || '').slice(0, 8)}`)
+        // 如果刚才自动修复了工作区不一致（上次更新中断留下的烂摊子），提示用户
+        const fixTip = status.worktreeFixed
+          ? `\n🔧 检测到上次更新中断导致工作区与 HEAD 不一致，已自动同步工作区到最新代码\n💡 建议发送 #重启 让代码生效`
+          : ''
+        return reply(e, `✅ ${label} 已是最新版本，无需更新\n分支：${status.branch}  提交：${(status.local || '').slice(0, 8)}${fixTip}`)
       }
 
       // 3) 有更新 → 告知落后多少个提交，再执行 pull
@@ -541,12 +649,30 @@ export class PluginManager extends PluginBase {
   }
 
   /**
-   * 检查插件是否有可用更新（不修改工作区）
+   * 检查插件是否有可用更新（不修改工作区，但会修复异常状态）
    * 通过 git fetch + 比对本地 HEAD 与远程 HEAD 来判断
+   *
+   * 关键修复：增加「工作区一致性检查」
+   *   场景：上次更新卡住被杀 → HEAD 已 fast-forward 到新 commit，
+   *        但工作区文件还是旧的（checkout 中途被中断）
+   *   此时 HEAD == origin/<branch>，传统检查会误判「已是最新」，
+   *   但实际代码是旧的
+   *   修复：检测到工作区与 HEAD 不一致时，强制 git checkout -- . 同步
+   *
    * @param {string} targetPath 插件目录
-   * @returns {Promise<{needUpdate:boolean, branch:string, local:string, remote:string, behind:number, reason?:string}>}
+   * @returns {Promise<{needUpdate:boolean, branch:string, local:string, remote:string, behind:number, reason?:string, worktreeFixed?:boolean}>}
    */
   async checkUpdateAvailable(targetPath) {
+    // 0) 先清理可能残留的 git 中间状态（上次更新被中断留下的烂摊子）
+    try {
+      const cleaned = await cleanupGitState(targetPath)
+      if (cleaned) {
+        Logger.warn(`[nidie] ${path.basename(targetPath)} 检测到上次更新中断残留，已清理`)
+      }
+    } catch (e) {
+      Logger.warn(`[nidie] cleanupGitState 失败（忽略继续）: ${e.message}`)
+    }
+
     // 1) git fetch 拉取远程引用，但不合并
     try {
       await execWithTimeout(
@@ -612,8 +738,43 @@ export class PluginManager extends PluginBase {
         }
       }
 
+      // 5) 工作区一致性检查（核心修复）
+      // 即使 HEAD == origin（看似已最新），也要检查工作区文件是否真的和 HEAD 一致
+      // 防止「HEAD 已更新但工作区是旧代码」的异常状态被误判为「已是最新」
+      let worktreeFixed = false
+      if (local && remote && local === remote) {
+        try {
+          // git status --porcelain 输出为空 = 工作区干净且和 HEAD 一致
+          // 输出非空 = 有未提交修改 或 工作区文件与 HEAD 不一致
+          const { stdout: statusOut } = await execAsync('git status --porcelain', { cwd: targetPath })
+          const dirty = (statusOut || '').trim()
+          if (dirty) {
+            // 工作区和 HEAD 不一致，但 HEAD 已是最新 → 上次更新被中断的烂摊子
+            // 用 git checkout -- . 强制同步工作区到 HEAD（保留 untracked 文件）
+            Logger.warn(`[nidie] ${path.basename(targetPath)} HEAD 已是最新但工作区与 HEAD 不一致（上次更新被中断？），执行 git checkout -- . 修复\n${dirty}`)
+            try {
+              await execAsync('git checkout -- .', { cwd: targetPath })
+              worktreeFixed = true
+              Logger.mark(`[nidie] ${path.basename(targetPath)} 工作区已同步到 HEAD`)
+            } catch (fixErr) {
+              // checkout 失败（可能有冲突文件），尝试更激进的 reset
+              Logger.warn(`[nidie] git checkout -- . 失败，尝试 git reset --hard HEAD: ${fixErr.message}`)
+              try {
+                await execAsync('git reset --hard HEAD', { cwd: targetPath })
+                worktreeFixed = true
+                Logger.mark(`[nidie] ${path.basename(targetPath)} 工作区已强制同步到 HEAD (reset --hard)`)
+              } catch (resetErr) {
+                Logger.error(`[nidie] ${path.basename(targetPath)} 工作区修复失败: ${resetErr.message}`)
+              }
+            }
+          }
+        } catch (statusErr) {
+          Logger.warn(`[nidie] git status 检查失败（跳过工作区一致性检查）: ${statusErr.message}`)
+        }
+      }
+
       const needUpdate = !local || !remote || local !== remote
-      return { needUpdate, branch, local, remote, behind }
+      return { needUpdate, branch, local, remote, behind, worktreeFixed }
     } catch (err) {
       Logger.warn(`[nidie] 比对 HEAD 失败，回退直接 pull: ${err.message}`)
       return { needUpdate: true, branch, local: '', remote: '', behind: -1, reason: 'compare_failed' }
@@ -650,7 +811,8 @@ export class PluginManager extends PluginBase {
       // 2) 已是最新 → 跳过，不执行 pull、不装依赖
       if (!status.needUpdate) {
         upToDate++
-        results.push(`✅ ${p.name}：已是最新`)
+        const fixTag = status.worktreeFixed ? '（已修复中断残留工作区）' : ''
+        results.push(`✅ ${p.name}：已是最新${fixTag}`)
         continue
       }
 
@@ -1200,6 +1362,9 @@ export class PluginManager extends PluginBase {
   /**
    * 安全的 git pull：先尝试 --ff-only，失败则自动 stash → pull → pop
    * 应对本地有修改导致无法快进合并的情况
+   *
+   * 注意：任何失败分支都会调用 cleanupGitState 清理中间状态，
+   * 防止 merge/rebase 进行中的状态残留到下次更新（会导致下次误判「已是最新」）
    */
   async safeGitPull(targetPath) {
     // 1) 尝试 --ff-only（最干净，不产生 merge commit）
@@ -1212,8 +1377,9 @@ export class PluginManager extends PluginBase {
       )
       return { ok: true, output: (stdout || '').trim() }
     } catch (ffErr) {
-      // 不是 fast-forward 错误 → 直接抛
+      // 不是 fast-forward 错误 → 直接抛（清理后抛）
       if (!/Not possible to fast-forward|refusing to merge unrelated histories/i.test(ffErr.message || '')) {
+        try { await cleanupGitState(targetPath) } catch (_) {}
         throw ffErr
       }
       // 是 ff-only 错误 → 走 stash 流程
@@ -1250,7 +1416,8 @@ export class PluginManager extends PluginBase {
         )
         output = (stdout || '').trim()
       } catch (rebaseErr) {
-        // 全部失败 → 恢复 stash
+        // 全部失败 → 清理中间状态（merge/rebase 进行中）再恢复 stash
+        try { await cleanupGitState(targetPath) } catch (_) {}
         if (stashed) {
           try { await execAsync('git stash pop', { cwd: targetPath }) } catch (_) {}
         }
