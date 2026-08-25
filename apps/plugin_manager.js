@@ -470,7 +470,9 @@ const PRESET_PLUGINS = {
   'humid-ql-plugin': 'https://gitee.com/qiannianyiyu/humid-ql-plugin.git',
   'delta-plugin': 'https://gitee.com/delta-dun/delta-plugin.git',
   'xiaofei-plugin': 'https://gitee.com/xiaofeio/Xiaofei-Plugin.git',
-  'cm-plugin': 'https://gitee.com/kyrk01/cm-plugin.git'
+  'cm-plugin': 'https://gitee.com/kyrk01/cm-plugin.git',
+  // ai0-plugin（别名 ai0）—— GitHub 仓库
+  'ai0': 'https://github.com/nidie2580/ai0-plugin.git'
 }
 
 function isMaster(e) {
