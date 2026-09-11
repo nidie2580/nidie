@@ -524,17 +524,17 @@ export class PluginManager extends PluginBase {
       event: 'message',
       priority: 50,
       rule: [
-        { reg: '^#?插件管理帮助$', fnc: 'showHelp' },
-        { reg: '^#?安装', fnc: 'installPlugin' },
-        { reg: '^#?删除', fnc: 'uninstallPlugin' },
-        { reg: '^#?更新插件', fnc: 'updatePlugin' },
-        { reg: '^#?更新全部插件$', fnc: 'updateAllPlugins' },
-        { reg: '^#?回滚插件', fnc: 'rollbackPlugin' },
-        { reg: '^#?插件列表$', fnc: 'listPlugins' },
-        { reg: '^#?插件详情', fnc: 'pluginDetail' },
-        { reg: '^#?插件市场$', fnc: 'listPresetPlugins' },
-        { reg: '^#?重载插件$', fnc: 'reloadPlugins' },
-        { reg: '^#?重启(插件)?$', fnc: 'restartBot' }
+        { reg: '^#插件管理帮助$', fnc: 'showHelp' },
+        { reg: '^#安装', fnc: 'installPlugin' },
+        { reg: '^#删除', fnc: 'uninstallPlugin' },
+        { reg: '^#更新插件', fnc: 'updatePlugin' },
+        { reg: '^#更新全部插件$', fnc: 'updateAllPlugins' },
+        { reg: '^#回滚插件', fnc: 'rollbackPlugin' },
+        { reg: '^#插件列表$', fnc: 'listPlugins' },
+        { reg: '^#插件详情', fnc: 'pluginDetail' },
+        { reg: '^#插件市场$', fnc: 'listPresetPlugins' },
+        { reg: '^#重载插件$', fnc: 'reloadPlugins' },
+        { reg: '^#重启(插件)?$', fnc: 'restartBot' }
       ]
     })
     this.taskLock = false
@@ -547,7 +547,7 @@ export class PluginManager extends PluginBase {
     if (this.taskLock) return reply(e, '⚠️ 当前已有任务在执行中，请稍后再试...')
 
     const text = String(e?.msg ?? e?.raw_message ?? '')
-    const input = text.replace(/^#?安装\s*/, '').trim()
+    const input = text.replace(/^#安装\s*/, '').trim()
     if (!input) return reply(e, '请提供插件名称或仓库地址\n示例：#安装 miao-plugin\n示例：#安装 https://gitee.com/xxx/xxx.git')
 
     const repoUrl = this.resolveRepoUrl(input)
@@ -616,7 +616,7 @@ export class PluginManager extends PluginBase {
     if (!isMaster(e)) return reply(e, '⚠️ 仅主人可使用 #删除')
 
     const text = String(e?.msg ?? e?.raw_message ?? '')
-    const name = text.replace(/^#?删除\s*/, '').trim()
+    const name = text.replace(/^#删除\s*/, '').trim()
     if (!name) return reply(e, '请提供插件名称\n示例：#删除 miao-plugin')
 
     const targetPath = this.findPluginPath(name)
@@ -646,7 +646,7 @@ export class PluginManager extends PluginBase {
     if (this.taskLock) return reply(e, '⚠️ 当前已有任务在执行中，请稍后再试...')
 
     const text = String(e?.msg ?? e?.raw_message ?? '')
-    const name = text.replace(/^#?更新插件\s*/, '').trim()
+    const name = text.replace(/^#更新插件\s*/, '').trim()
     if (!name) return reply(e, '请提供插件名称\n示例：#更新插件 miao-plugin\n示例：#更新插件 nidie')
 
     // 识别本插件（自我更新）
@@ -733,8 +733,8 @@ export class PluginManager extends PluginBase {
   isSelfRepoUrl(input) {
     if (!input || typeof input !== 'string') return false
     const SELF_REPO_PATTERNS = [
-      /github\.com[/:]nidie2580\/nidie/i,
-      /gitee\.com[/:]nidie2580\/nidie/i,
+      /github\.com[:/]nidie2580\/nidie/i,
+      /gitee\.com[:/]nidie2580\/nidie/i,
       /^nidie2580\/nidie$/i
     ]
     return SELF_REPO_PATTERNS.some(re => re.test(input))
@@ -947,7 +947,7 @@ export class PluginManager extends PluginBase {
     if (this.taskLock) return reply(e, '⚠️ 当前已有任务在执行中，请稍后再试...')
 
     const text = String(e?.msg ?? e?.raw_message ?? '')
-    const name = text.replace(/^#?回滚插件\s*/, '').trim()
+    const name = text.replace(/^#回滚插件\s*/, '').trim()
     if (!name) {
       // 不带参数 → 列出所有可回滚的插件
       const all = readAllRollbackSnapshots()
@@ -1101,7 +1101,7 @@ export class PluginManager extends PluginBase {
 
   async pluginDetail(e) {
     const text = String(e?.msg ?? e?.raw_message ?? '')
-    const name = text.replace(/^#?插件详情\s*/, '').trim()
+    const name = text.replace(/^#插件详情\s*/, '').trim()
     if (!name) return reply(e, '请提供插件名称\n示例：#插件详情 miao-plugin')
 
     const targetPath = this.findPluginPath(name)
