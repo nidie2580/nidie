@@ -1,7 +1,7 @@
 # nidie - Yunzai-Bot 插件管理器
 
 一个适用于 [Yunzai-Bot](https://github.com/Le-niao/Yunzai-Bot) 的插件管理器，可在群聊中直接安装、卸载、更新、查看其他插件。
-
+>本插件维护模式为不定期更新，原因是主要精力都集中在了ai0-plugin，敬请谅解
 ## ✨ 功能特性
 
 - 📦 **一键安装**：通过预设插件名或 git 仓库地址安装插件
